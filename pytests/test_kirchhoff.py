@@ -492,10 +492,14 @@ def test_kirchhoff3d_trav_vs_travsrcrec(par):
 
 
 def _shot_recs_example(nsx, nrx):
-    """Per-shot receiver subsets: each shot drops one (rotating) receiver,
-    so shot sizes can be uneven and exercise the padded layout."""
+    """Per-shot receiver subsets with *uneven* sizes so the padded layout is
+    genuinely exercised: even shots record at all receivers, odd shots drop the
+    last one. With nrx>=2 this yields max_recs=nrx and shorter shots whose
+    trailing padded slots must be zero-filled."""
     return [
-        npp.array([j for j in range(nrx) if j != (i % nrx)], dtype=npp.int32)
+        npp.arange(nrx, dtype=npp.int32)
+        if i % 2 == 0
+        else npp.arange(nrx - 1, dtype=npp.int32)
         for i in range(nsx)
     ]
 
