@@ -4,6 +4,17 @@
 ############################
 
 
+Version 2.8.0
+-------------
+
+*Unreleased*
+
+* Added multi-shot acquisition support to :py:class:`pylops.waveeqprocessing.Kirchhoff`
+  via the ``shot_recs`` parameter, allowing each shot to record at a
+  shot-specific subset of receivers (padded ``(n_shots, max_recs, nt)`` data
+  layout). Supported for the ``numpy`` and ``numba`` engines.
+
+
 Version 2.7.0
 -------------
 

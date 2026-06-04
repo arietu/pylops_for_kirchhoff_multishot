@@ -508,8 +508,12 @@ def _shot_recs_example(nsx, nrx):
     int(os.environ.get("TEST_CUPY_PYLOPS", 0)) == 1, reason="Not CuPy enabled"
 )
 @pytest.mark.parametrize("par", [(par1), (par2), (par1d), (par2d)])
-def test_kirchhoff_multishot_dottest(par):
-    """Dot-test for multishot Kirchhoff operator (analytic/eikonal, kinematic/dynamic)."""
+@pytest.mark.parametrize("engine", ["numpy", "numba"])
+def test_kirchhoff_multishot_dottest(par, engine):
+    """Dot-test for multishot Kirchhoff operator (analytic/eikonal, kinematic/dynamic).
+
+    Parametrized over the numpy and numba engines (numba falls back to numpy
+    with a warning if not installed)."""
     if par["mode"] == "eikonal" and not skfmm_enabled:
         pytest.skip("skfmm not available")
     vel = v0 * np.ones((PAR["nx"], PAR["nz"]))
@@ -530,7 +534,7 @@ def test_kirchhoff_multishot_dottest(par):
         mode=par["mode"],
         dynamic=par["dynamic"],
         shot_recs=shot_recs,
-        engine="numpy",
+        engine=engine,
     )
     assert Dop.nsnr == ntrace
     assert Dop.dimsd == (PAR["nsx"], max_recs, PAR["nt"])

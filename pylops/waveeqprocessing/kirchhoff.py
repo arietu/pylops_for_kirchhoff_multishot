@@ -111,7 +111,7 @@ class Kirchhoff(LinearOperator):
         Deprecated, will be removed in v3.0.0. Simply kept for back-compatibility with previous implementation,
         but effectively not affecting the behaviour of the operator.
     shot_recs : :obj:`list` of :obj:`numpy.ndarray`, optional
-        .. versionadded:: 2.2.0
+        .. versionadded:: 2.8.0
 
         List of length ``n_s`` where ``shot_recs[i]`` is an integer array of
         receiver indices active for shot ``i``. When ``None`` (default), the
@@ -145,6 +145,18 @@ class Kirchhoff(LinearOperator):
     ni : :obj:`int`
         Number of image points (``ni=nx*nz`` if ``ndims=2`` and
         ``ni=ny*nx*nz`` if ``ndims=3``).
+    nshots : :obj:`int`
+        Number of shots (equal to ``ns``; only meaningful when ``shot_recs`` is
+        provided, where each shot fires one source at a subset of receivers).
+    max_recs : :obj:`int`
+        Largest number of active receivers across all shots (``nr`` when
+        ``shot_recs`` is not provided). Sets the padded receiver axis of the
+        multi-shot data, of shape :math:`\lbrack n_{shots} \times max\_recs
+        \times n_t \rbrack`.
+    shot_offsets : :obj:`numpy.ndarray`
+        Cumulative flat-trace offsets per shot of size ``ns+1`` (only defined
+        when ``shot_recs`` is provided); ``shot_offsets[i]:shot_offsets[i+1]``
+        are the flat-trace indices belonging to shot ``i``.
     six : :obj:`numpy.ndarray`
         ix locations of sources (1d array of size ``ns*nr``).
     rix : :obj:`numpy.ndarray`
