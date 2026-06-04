@@ -489,3 +489,150 @@ def test_kirchhoff3d_trav_vs_travsrcrec(par):
         0, 1, PAR["nry"] * PAR["nrx"] * PAR["nsy"] * PAR["nsx"] * PAR["nt"]
     )
     assert_array_almost_equal(Dop.H @ yy, D1op.H @ yy, decimal=2)
+
+
+def _shot_recs_example(nsx, nrx):
+    """Per-shot receiver subsets: each shot drops one (rotating) receiver,
+    so shot sizes can be uneven and exercise the padded layout."""
+    return [
+        npp.array([j for j in range(nrx) if j != (i % nrx)], dtype=npp.int32)
+        for i in range(nsx)
+    ]
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("TEST_CUPY_PYLOPS", 0)) == 1, reason="Not CuPy enabled"
+)
+@pytest.mark.parametrize("par", [(par1), (par2), (par1d), (par2d)])
+def test_kirchhoff_multishot_dottest(par):
+    """Dot-test for multishot Kirchhoff operator (analytic/eikonal, kinematic/dynamic)."""
+    if par["mode"] == "eikonal" and not skfmm_enabled:
+        pytest.skip("skfmm not available")
+    vel = v0 * np.ones((PAR["nx"], PAR["nz"]))
+    shot_recs = _shot_recs_example(PAR["nsx"], PAR["nrx"])
+    ntrace = sum(len(sr) for sr in shot_recs)
+    max_recs = max(len(sr) for sr in shot_recs)
+
+    Dop = Kirchhoff(
+        z,
+        x,
+        t,
+        s2d,
+        r2d,
+        vel if par["mode"] == "eikonal" else v0,
+        wav,
+        wavc,
+        y=None,
+        mode=par["mode"],
+        dynamic=par["dynamic"],
+        shot_recs=shot_recs,
+        engine="numpy",
+    )
+    assert Dop.nsnr == ntrace
+    assert Dop.dimsd == (PAR["nsx"], max_recs, PAR["nt"])
+    assert dottest(
+        Dop,
+        PAR["nsx"] * max_recs * PAR["nt"],
+        PAR["nz"] * PAR["nx"],
+        backend=backend,
+        rtol=1e-6,
+    )
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("TEST_CUPY_PYLOPS", 0)) == 1, reason="Not CuPy enabled"
+)
+@pytest.mark.parametrize("par", [(par1), (par1d)])
+def test_kirchhoff_multishot_matches_dense(par):
+    """Forward of multishot operator equals the full-Cartesian operator
+    restricted to the active (shot, receiver) traces; inactive padded slots
+    are exactly zero."""
+    vel = v0 * np.ones((PAR["nx"], PAR["nz"]))
+    shot_recs = _shot_recs_example(PAR["nsx"], PAR["nrx"])
+    max_recs = max(len(sr) for sr in shot_recs)
+
+    common = dict(
+        mode=par["mode"],
+        dynamic=par["dynamic"],
+        engine="numpy",
+    )
+    Dfull = Kirchhoff(
+        z, x, t, s2d, r2d,
+        vel if par["mode"] == "eikonal" else v0,
+        wav, wavc, y=None, **common,
+    )
+    Dshot = Kirchhoff(
+        z, x, t, s2d, r2d,
+        vel if par["mode"] == "eikonal" else v0,
+        wav, wavc, y=None, shot_recs=shot_recs, **common,
+    )
+
+    m = npp.random.normal(0, 1, PAR["nx"] * PAR["nz"])
+    yfull = (Dfull * m).reshape(PAR["nsx"], PAR["nrx"], PAR["nt"])
+    yshot = (Dshot * m).reshape(PAR["nsx"], max_recs, PAR["nt"])
+
+    for ishot, sr in enumerate(shot_recs):
+        for slot, irec in enumerate(sr):
+            assert_array_almost_equal(
+                yshot[ishot, slot], yfull[ishot, irec], decimal=10
+            )
+        # padded (inactive) slots must be exactly zero
+        for slot in range(len(sr), max_recs):
+            assert np.all(yshot[ishot, slot] == 0)
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("TEST_CUPY_PYLOPS", 0)) == 1, reason="Not CuPy enabled"
+)
+def test_kirchhoff_multishot_validation():
+    """shot_recs validation and unsupported-combination errors."""
+    base = dict(mode="analytic", engine="numpy")
+
+    # wrong length
+    with pytest.raises(ValueError):
+        Kirchhoff(
+            z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+            shot_recs=[npp.array([0])], **base,
+        )
+
+    # out-of-range receiver index
+    bad = [npp.array([0]) for _ in range(PAR["nsx"])]
+    bad[0] = npp.array([PAR["nrx"]])  # == nr, out of range
+    with pytest.raises(ValueError):
+        Kirchhoff(
+            z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+            shot_recs=bad, **base,
+        )
+
+    # non-1-D entry
+    bad2 = [npp.array([0]) for _ in range(PAR["nsx"])]
+    bad2[0] = npp.zeros((1, 2), dtype=npp.int32)
+    with pytest.raises(ValueError):
+        Kirchhoff(
+            z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+            shot_recs=bad2, **base,
+        )
+
+    # single-table trav + shot_recs not supported
+    good = _shot_recs_example(PAR["nsx"], PAR["nrx"])
+    trav_srcs, trav_recs, _, _, _, _ = Kirchhoff._traveltime_table(
+        z, x, s2d, r2d, v0, mode="analytic"
+    )
+    trav_single = trav_srcs.reshape(
+        PAR["nx"] * PAR["nz"], PAR["nsx"], 1
+    ) + trav_recs.reshape(PAR["nx"] * PAR["nz"], 1, PAR["nrx"])
+    trav_single = trav_single.reshape(
+        PAR["nx"] * PAR["nz"], PAR["nsx"] * PAR["nrx"]
+    )
+    with pytest.raises(ValueError):
+        Kirchhoff(
+            z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+            mode="byot", trav=trav_single, shot_recs=good, engine="numpy",
+        )
+
+    # cuda + shot_recs not supported
+    with pytest.raises(NotImplementedError):
+        Kirchhoff(
+            z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+            shot_recs=good, mode="analytic", engine="cuda",
+        )
