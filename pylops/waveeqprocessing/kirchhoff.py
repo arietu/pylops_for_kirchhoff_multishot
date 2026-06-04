@@ -373,8 +373,9 @@ class Kirchhoff(LinearOperator):
                     f"len(shot_recs) must equal the number of sources ({ns}), "
                     f"got {len(shot_recs)}"
                 )
+            # validate without mutating the caller's list
+            shot_recs = [np.asarray(sr, dtype=np.int32) for sr in shot_recs]
             for ishot, sr in enumerate(shot_recs):
-                sr = np.asarray(sr, dtype=np.int32)
                 if sr.ndim != 1:
                     raise ValueError(
                         f"shot_recs[{ishot}] must be a 1-D array of receiver indices"
@@ -383,7 +384,6 @@ class Kirchhoff(LinearOperator):
                     raise ValueError(
                         f"shot_recs[{ishot}] contains receiver indices outside [0, {nr})"
                     )
-                shot_recs[ishot] = sr
             # build flat mapping arrays
             self._src_indices = np.concatenate(
                 [np.full(len(sr), ishot, dtype=np.int32) for ishot, sr in enumerate(shot_recs)]
@@ -395,6 +395,11 @@ class Kirchhoff(LinearOperator):
             for ishot, sr in enumerate(shot_recs):
                 self._shot_offsets[ishot + 1] = self._shot_offsets[ishot] + len(sr)
             ntrace_total = int(self._shot_offsets[-1])
+            if ntrace_total == 0:
+                raise ValueError(
+                    "shot_recs defines no active traces; at least one shot "
+                    "must record at one or more receivers"
+                )
             # padded-layout bookkeeping
             self.nshots = ns
             self.max_recs = int(max(len(sr) for sr in shot_recs))
