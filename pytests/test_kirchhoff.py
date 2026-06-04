@@ -593,7 +593,7 @@ def test_kirchhoff_multishot_validation():
     base = dict(mode="analytic", engine="numpy")
 
     # wrong length
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must equal the number of sources"):
         Kirchhoff(
             z, x, t, s2d, r2d, v0, wav, wavc, y=None,
             shot_recs=[npp.array([0])], **base,
@@ -602,7 +602,7 @@ def test_kirchhoff_multishot_validation():
     # out-of-range receiver index
     bad = [npp.array([0]) for _ in range(PAR["nsx"])]
     bad[0] = npp.array([PAR["nrx"]])  # == nr, out of range
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="outside"):
         Kirchhoff(
             z, x, t, s2d, r2d, v0, wav, wavc, y=None,
             shot_recs=bad, **base,
@@ -611,7 +611,7 @@ def test_kirchhoff_multishot_validation():
     # non-1-D entry
     bad2 = [npp.array([0]) for _ in range(PAR["nsx"])]
     bad2[0] = npp.zeros((1, 2), dtype=npp.int32)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must be a 1-D array"):
         Kirchhoff(
             z, x, t, s2d, r2d, v0, wav, wavc, y=None,
             shot_recs=bad2, **base,
@@ -628,14 +628,14 @@ def test_kirchhoff_multishot_validation():
     trav_single = trav_single.reshape(
         PAR["nx"] * PAR["nz"], PAR["nsx"] * PAR["nrx"]
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="separate traveltime tables"):
         Kirchhoff(
             z, x, t, s2d, r2d, v0, wav, wavc, y=None,
             mode="byot", trav=trav_single, shot_recs=good, engine="numpy",
         )
 
     # cuda + shot_recs not supported
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(NotImplementedError, match="cuda"):
         Kirchhoff(
             z, x, t, s2d, r2d, v0, wav, wavc, y=None,
             shot_recs=good, mode="analytic", engine="cuda",
