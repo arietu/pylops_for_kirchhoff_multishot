@@ -60,8 +60,6 @@ class Kirchhoff(LinearOperator):
         Receivers in array of size :math:`\lbrack 2 (3) \times n_r \rbrack`
         The first axis should be ordered as (``y``,) ``x``, ``z``.
     vel : :obj:`numpy.ndarray` or :obj:`float`
-        .. deprecated:: 2.0.0
-            Use ``vel`` instead.
         Velocity model of size :math:`\lbrack (n_y\,\times)\; n_x
         \times n_z \rbrack` (or constant)
     wav : :obj:`numpy.ndarray`
