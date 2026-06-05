@@ -110,6 +110,13 @@ class Kirchhoff(LinearOperator):
     snell : :obj:`float` or :obj:`tuple`, optional
         Deprecated, will be removed in v3.0.0. Simply kept for back-compatibility with previous implementation,
         but effectively not affecting the behaviour of the operator.
+    shot_recs : :obj:`list` of :obj:`numpy.ndarray`, optional
+        .. versionadded:: 2.8.0
+
+        List of length ``n_s`` where ``shot_recs[i]`` is an integer array of
+        receiver indices active for shot ``i``. When ``None`` (default), the
+        full Cartesian product of all sources and receivers is used (original
+        behaviour). Each entry must contain indices in ``[0, n_r)``.
     engine : :obj:`str`, optional
         Engine used for computations (``numpy``, ``numba`` or ``cuda``).
     dtype : :obj:`str`, optional
@@ -134,10 +141,22 @@ class Kirchhoff(LinearOperator):
     nt : :obj:`int`
         Number of samples in time axis.
     nsnr : :obj:`int`
-        Number of source-receiver pairs.
+        Number of source-receiver pairs (total number of traces).
     ni : :obj:`int`
         Number of image points (``ni=nx*nz`` if ``ndims=2`` and
         ``ni=ny*nx*nz`` if ``ndims=3``).
+    nshots : :obj:`int`
+        Number of shots (equal to ``ns``; only meaningful when ``shot_recs`` is
+        provided, where each shot fires one source at a subset of receivers).
+    max_recs : :obj:`int`
+        Largest number of active receivers across all shots (``nr`` when
+        ``shot_recs`` is not provided). Sets the padded receiver axis of the
+        multi-shot data, of shape :math:`\lbrack n_{shots} \times max\_recs
+        \times n_t \rbrack`.
+    shot_offsets : :obj:`numpy.ndarray`
+        Cumulative flat-trace offsets per shot of size ``ns+1`` (only defined
+        when ``shot_recs`` is provided); ``shot_offsets[i]:shot_offsets[i+1]``
+        are the flat-trace indices belonging to shot ``i``.
     six : :obj:`numpy.ndarray`
         ix locations of sources (1d array of size ``ns*nr``).
     rix : :obj:`numpy.ndarray`
@@ -322,6 +341,7 @@ class Kirchhoff(LinearOperator):
         aperture: tuple[float, float] | None = None,
         angleaperture: float | tuple[float, float] = 90.0,
         snell: tuple[float, float] | None = None,
+        shot_recs: list[NDArray] | None = None,
         engine: Tengine_nnc = "numpy",
         dtype: DTypeLike = "float64",
         name: str = "K",
@@ -357,21 +377,77 @@ class Kirchhoff(LinearOperator):
         self.dt = t[1] - t[0]
         self.nt = len(t)
 
+        # validate and set up multi-shot mapping
+        self._multishot = shot_recs is not None
+        if self._multishot:
+            if len(shot_recs) != ns:
+                raise ValueError(
+                    f"len(shot_recs) must equal the number of sources ({ns}), "
+                    f"got {len(shot_recs)}"
+                )
+            # validate without mutating the caller's list
+            shot_recs = [np.asarray(sr, dtype=np.int32) for sr in shot_recs]
+            for ishot, sr in enumerate(shot_recs):
+                if sr.ndim != 1:
+                    raise ValueError(
+                        f"shot_recs[{ishot}] must be a 1-D array of receiver indices"
+                    )
+                if np.any(sr < 0) or np.any(sr >= nr):
+                    raise ValueError(
+                        f"shot_recs[{ishot}] contains receiver indices outside [0, {nr})"
+                    )
+            # build flat mapping arrays
+            self._src_indices = np.concatenate(
+                [np.full(len(sr), ishot, dtype=np.int32) for ishot, sr in enumerate(shot_recs)]
+            )
+            self._rec_indices = np.concatenate(
+                [sr.astype(np.int32) for sr in shot_recs]
+            )
+            self._shot_offsets = np.zeros(ns + 1, dtype=np.int32)
+            for ishot, sr in enumerate(shot_recs):
+                self._shot_offsets[ishot + 1] = self._shot_offsets[ishot] + len(sr)
+            ntrace_total = int(self._shot_offsets[-1])
+            if ntrace_total == 0:
+                raise ValueError(
+                    "shot_recs defines no active traces; at least one shot "
+                    "must record at one or more receivers"
+                )
+            # padded-layout bookkeeping
+            self.nshots = ns
+            self.max_recs = int(max(len(sr) for sr in shot_recs))
+            self.shot_offsets = self._shot_offsets
+            # map each flat trace to its position in the flattened padded
+            # (n_shots, max_recs) grid: shot * max_recs + within-shot slot
+            slots = np.concatenate(
+                [np.arange(len(sr), dtype=np.int64) for sr in shot_recs]
+            )
+            self._pad_index = (
+                self._src_indices.astype(np.int64) * self.max_recs + slots
+            )
+        else:
+            ntrace_total = ns * nr
+            self.nshots = ns
+            self.max_recs = nr
+
         # store ix-iy locations of sources and receivers for aperture filter
         self.dynamic = dynamic
         if self.dynamic:
             dx = x[1] - x[0]
             if self.ndims == 2:
-                self.six = (
-                    np.tile((srcs[0] - x[0]) // dx, (nr, 1)).T.astype(int).ravel()
-                )
-                self.rix = np.tile((recs[0] - x[0]) // dx, (ns, 1)).astype(int).ravel()
+                if self._multishot:
+                    self.six = ((srcs[0][self._src_indices] - x[0]) // dx).astype(int)
+                    self.rix = ((recs[0][self._rec_indices] - x[0]) // dx).astype(int)
+                else:
+                    self.six = (
+                        np.tile((srcs[0] - x[0]) // dx, (nr, 1)).T.astype(int).ravel()
+                    )
+                    self.rix = np.tile((recs[0] - x[0]) // dx, (ns, 1)).astype(int).ravel()
             elif self.ndims == 3:
                 # TODO: compute 3D indices for aperture filter
                 # currently no aperture filter in 3D... just make indices 0
                 # so check if always passed
-                self.six = np.zeros(nr * ns)
-                self.rix = np.zeros(nr * ns)
+                self.six = np.zeros(ntrace_total)
+                self.rix = np.zeros(ntrace_total)
 
         # compute traveltime and distances
         self.travsrcrec = True  # use separate tables for src and rec traveltimes
@@ -407,6 +483,11 @@ class Kirchhoff(LinearOperator):
                 if isinstance(trav, tuple):
                     self.trav_srcs, self.trav_recs = trav
                 else:
+                    if self._multishot:
+                        raise ValueError(
+                            "shot_recs requires separate traveltime tables "
+                            "(trav must be a tuple of source and receiver tables)"
+                        )
                     self.travsrcrec = False
                     self.trav = trav
 
@@ -476,7 +557,7 @@ class Kirchhoff(LinearOperator):
         else:
             self.wav = wav
         self.cop = Convolve1D(
-            (ns * nr, self.nt), h=self.wav, offset=wavcenter, axis=1, dtype=dtype
+            (ntrace_total, self.nt), h=self.wav, offset=wavcenter, axis=1, dtype=dtype
         )
 
         # create fixed-size aperture taper for all apertures
@@ -513,10 +594,13 @@ class Kirchhoff(LinearOperator):
 
         # dimensions
         self.ns, self.nr = ns, nr
-        self.nsnr = ns * nr
+        self.nsnr = ntrace_total
         self.ni = np.prod(dims)
         dims = tuple(dims) if self.ndims == 2 else (dims[0] * dims[1], dims[2])
-        dimsd = (ns, nr, self.nt)
+        if self._multishot:
+            dimsd = (self.nshots, self.max_recs, self.nt)
+        else:
+            dimsd = (ns, nr, self.nt)
         super().__init__(dtype=np.dtype(dtype), dims=dims, dimsd=dimsd, name=name)
         # save velocity if using dynamic to compute amplitudes
         if self.dynamic:
@@ -857,6 +941,288 @@ class Kirchhoff(LinearOperator):
         return y
 
     @staticmethod
+    def _travsrcrec_shots_kirch_matvec(
+        x: NDArray,
+        y: NDArray,
+        nt: int,
+        ni: int,
+        dt: float,
+        trav_srcs: NDArray,
+        trav_recs: NDArray,
+        ntrace: int,
+        src_indices: NDArray,
+        rec_indices: NDArray,
+    ) -> NDArray:
+        for itrace in prange(ntrace):
+            isrc = src_indices[itrace]
+            irec = rec_indices[itrace]
+            travisrc = trav_srcs[:, isrc]
+            travirec = trav_recs[:, irec]
+            trav = travisrc + travirec
+            itrav = (trav / dt).astype("int32")
+            travd = trav / dt - itrav
+            for ii in range(ni):
+                itravii = itrav[ii]
+                travdii = travd[ii]
+                if 0 <= itravii < nt - 1:
+                    y[itrace, itravii] += x[ii] * (1 - travdii)
+                    y[itrace, itravii + 1] += x[ii] * travdii
+        return y
+
+    @staticmethod
+    def _travsrcrec_shots_kirch_rmatvec(
+        x: NDArray,
+        y: NDArray,
+        nt: int,
+        ni: int,
+        dt: float,
+        trav_srcs: NDArray,
+        trav_recs: NDArray,
+        ntrace: int,
+        src_indices: NDArray,
+        rec_indices: NDArray,
+    ) -> NDArray:
+        for ii in prange(ni):
+            trav_srcsii = trav_srcs[ii]
+            trav_recsii = trav_recs[ii]
+            for itrace in range(ntrace):
+                isrc = src_indices[itrace]
+                irec = rec_indices[itrace]
+                trav_srcii = trav_srcsii[isrc]
+                trav_recii = trav_recsii[irec]
+                travii = trav_srcii + trav_recii
+                itravii = int(travii / dt)
+                travdii = travii / dt - itravii
+                if 0 <= itravii < nt - 1:
+                    y[ii] += (
+                        x[itrace, itravii] * (1 - travdii)
+                        + x[itrace, itravii + 1] * travdii
+                    )
+        return y
+
+    @staticmethod
+    def _ampsrcrec_shots_kirch_matvec(
+        x: NDArray,
+        y: NDArray,
+        nt: int,
+        ni: int,
+        dt: float,
+        vel: NDArray,
+        trav_srcs: NDArray,
+        trav_recs: NDArray,
+        amp_srcs: NDArray,
+        amp_recs: NDArray,
+        aperturemin: float,
+        aperturemax: float,
+        aperturetap: NDArray,
+        nz: int,
+        six: NDArray,
+        rix: NDArray,
+        angleaperturemin: float,
+        angleaperturemax: float,
+        angles_srcs: NDArray,
+        angles_recs: NDArray,
+        ntrace: int,
+        src_indices: NDArray,
+        rec_indices: NDArray,
+    ) -> NDArray:
+        daperture = aperturemax - aperturemin
+        dangleaperture = angleaperturemax - angleaperturemin
+        for itrace in prange(ntrace):
+            isrc = src_indices[itrace]
+            irec = rec_indices[itrace]
+            travisrc = trav_srcs[:, isrc]
+            ampisrc = amp_srcs[:, isrc]
+            angleisrc = angles_srcs[:, isrc]
+            travirec = trav_recs[:, irec]
+            trav = travisrc + travirec
+            itrav = (trav / dt).astype("int32")
+            travd = trav / dt - itrav
+            ampirec = amp_recs[:, irec]
+            angleirec = angles_recs[:, irec]
+            sixitrace = six[itrace]
+            rixitrace = rix[itrace]
+            # compute cosine of half opening angle and total amplitude scaling
+            cosangle = np.cos((angleisrc - angleirec) / 2.0)
+            amp = 2.0 * cosangle * ampisrc * ampirec / vel
+            for ii in range(ni):
+                itravii = itrav[ii]
+                travdii = travd[ii]
+                damp = amp[ii]
+                # extract source and receiver angle at given image point
+                angle_src = angleisrc[ii]
+                angle_rec = angleirec[ii]
+                abs_angle_src = abs(angle_src)
+                abs_angle_rec = abs(angle_rec)
+                # angle apertures checks
+                aptap = 1.0
+                if (
+                    abs_angle_src < angleaperturemax
+                    and abs_angle_rec < angleaperturemax
+                ):
+                    if abs_angle_src >= angleaperturemin:
+                        # extract source angle aperture taper value
+                        aptap = (
+                            aptap
+                            * aperturetap[
+                                int(
+                                    20
+                                    * (abs_angle_src - angleaperturemin)
+                                    // dangleaperture
+                                )
+                            ]
+                        )
+                    if abs_angle_rec >= angleaperturemin:
+                        # extract receiver angle aperture taper value
+                        aptap = (
+                            aptap
+                            * aperturetap[
+                                int(
+                                    20
+                                    * (abs_angle_rec - angleaperturemin)
+                                    // dangleaperture
+                                )
+                            ]
+                        )
+
+                    # identify z-index of image point
+                    iz = ii % nz
+                    # aperture check
+                    aperture = abs(sixitrace - rixitrace) / (iz + 1)
+                    if aperture < aperturemax:
+                        if aperture >= aperturemin:
+                            # extract aperture taper value
+                            aptap = (
+                                aptap
+                                * aperturetap[
+                                    int(
+                                        20 * ((aperture - aperturemin) // daperture)
+                                    )
+                                ]
+                            )
+                        # time limit check
+                        if 0 <= itravii < nt - 1:
+                            y[itrace, itravii] += (
+                                x[ii] * (1 - travdii) * damp * aptap
+                            )
+                            y[itrace, itravii + 1] += (
+                                x[ii] * travdii * damp * aptap
+                            )
+        return y
+
+    @staticmethod
+    def _ampsrcrec_shots_kirch_rmatvec(
+        x: NDArray,
+        y: NDArray,
+        nt: int,
+        ni: int,
+        dt: float,
+        vel: NDArray,
+        trav_srcs: NDArray,
+        trav_recs: NDArray,
+        amp_srcs: NDArray,
+        amp_recs: NDArray,
+        aperturemin: float,
+        aperturemax: float,
+        aperturetap: NDArray,
+        nz: int,
+        six: NDArray,
+        rix: NDArray,
+        angleaperturemin: float,
+        angleaperturemax: float,
+        angles_srcs: NDArray,
+        angles_recs: NDArray,
+        ntrace: int,
+        src_indices: NDArray,
+        rec_indices: NDArray,
+    ) -> NDArray:
+        daperture = aperturemax - aperturemin
+        dangleaperture = angleaperturemax - angleaperturemin
+        for ii in prange(ni):
+            trav_srcsii = trav_srcs[ii]
+            trav_recsii = trav_recs[ii]
+            amp_srcsii = amp_srcs[ii]
+            amp_recsii = amp_recs[ii]
+            velii = vel[ii]
+            angle_srcsii = angles_srcs[ii]
+            angle_recsii = angles_recs[ii]
+            # identify z-index of image point
+            iz = ii % nz
+            for itrace in range(ntrace):
+                isrc = src_indices[itrace]
+                irec = rec_indices[itrace]
+                trav_srcii = trav_srcsii[isrc]
+                trav_recii = trav_recsii[irec]
+                travii = trav_srcii + trav_recii
+                itravii = int(travii / dt)
+                travdii = travii / dt - itravii
+                amp_srcii = amp_srcsii[isrc]
+                amp_recii = amp_recsii[irec]
+                angle_src = angle_srcsii[isrc]
+                angle_rec = angle_recsii[irec]
+                sixitrace = six[itrace]
+                rixitrace = rix[itrace]
+                abs_angle_src = abs(angle_src)
+                abs_angle_rec = abs(angle_rec)
+                # compute cosine of half opening angle and total amplitude scaling
+                cosangle = np.cos((angle_src - angle_rec) / 2.0)
+                damp = 2.0 * cosangle * amp_srcii * amp_recii / velii
+                # angle apertures checks
+                aptap = 1.0
+                if (
+                    abs_angle_src < angleaperturemax
+                    and abs_angle_rec < angleaperturemax
+                ):
+                    if abs_angle_src >= angleaperturemin:
+                        # extract source angle aperture taper value
+                        aptap = (
+                            aptap
+                            * aperturetap[
+                                int(
+                                    20
+                                    * (abs_angle_src - angleaperturemin)
+                                    // dangleaperture
+                                )
+                            ]
+                        )
+                    if abs_angle_rec >= angleaperturemin:
+                        # extract receiver angle aperture taper value
+                        aptap = (
+                            aptap
+                            * aperturetap[
+                                int(
+                                    20
+                                    * (abs_angle_rec - angleaperturemin)
+                                    // dangleaperture
+                                )
+                            ]
+                        )
+
+                    # aperture check
+                    aperture = abs(sixitrace - rixitrace) / (iz + 1)
+                    if aperture < aperturemax:
+                        if aperture >= aperturemin:
+                            # extract aperture taper value
+                            aptap = (
+                                aptap
+                                * aperturetap[
+                                    int(20 * ((aperture - aperturemin) // daperture))
+                                ]
+                            )
+                        # time limit check
+                        if 0 <= itravii < nt - 1:
+                            # assign values
+                            y[ii] += (
+                                (
+                                    x[itrace, itravii] * (1 - travdii)
+                                    + x[itrace, itravii + 1] * travdii
+                                )
+                                * damp
+                                * aptap
+                            )
+        return y
+
+    @staticmethod
     def _ampsrcrec_kirch_matvec(
         x: NDArray,
         y: NDArray,
@@ -1080,11 +1446,28 @@ class Kirchhoff(LinearOperator):
         if engine not in ["numpy", "numba", "cuda"]:
             msg = f"engine must be numpy or numba or cuda, got {engine}"
             raise ValueError(msg)
+        if self._multishot and engine == "cuda":
+            msg = "engine='cuda' is not supported together with shot_recs; use engine='numpy' or 'numba'"
+            raise NotImplementedError(msg)
         if engine == "numba" and jit_message is None:
             numba_opts = dict(
                 nopython=True, nogil=True, parallel=parallel
             )  # fastmath=True,
-            if self.dynamic and self.travsrcrec:
+            if self._multishot and self.dynamic:
+                self._kirch_matvec = jit(**numba_opts)(
+                    self._ampsrcrec_shots_kirch_matvec
+                )
+                self._kirch_rmatvec = jit(**numba_opts)(
+                    self._ampsrcrec_shots_kirch_rmatvec
+                )
+            elif self._multishot:
+                self._kirch_matvec = jit(**numba_opts)(
+                    self._travsrcrec_shots_kirch_matvec
+                )
+                self._kirch_rmatvec = jit(**numba_opts)(
+                    self._travsrcrec_shots_kirch_rmatvec
+                )
+            elif self.dynamic and self.travsrcrec:
                 self._kirch_matvec = jit(**numba_opts)(self._ampsrcrec_kirch_matvec)
                 self._kirch_rmatvec = jit(**numba_opts)(self._ampsrcrec_kirch_rmatvec)
             elif self.travsrcrec:
@@ -1110,7 +1493,13 @@ class Kirchhoff(LinearOperator):
         else:
             if engine == "numba" and jit_message is not None:
                 logger.warning(jit_message)
-            if self.dynamic and self.travsrcrec:
+            if self._multishot and self.dynamic:
+                self._kirch_matvec = self._ampsrcrec_shots_kirch_matvec
+                self._kirch_rmatvec = self._ampsrcrec_shots_kirch_rmatvec
+            elif self._multishot:
+                self._kirch_matvec = self._travsrcrec_shots_kirch_matvec
+                self._kirch_rmatvec = self._travsrcrec_shots_kirch_rmatvec
+            elif self.dynamic and self.travsrcrec:
                 self._kirch_matvec = self._ampsrcrec_kirch_matvec
                 self._kirch_rmatvec = self._ampsrcrec_kirch_rmatvec
             elif self.travsrcrec:
@@ -1124,6 +1513,53 @@ class Kirchhoff(LinearOperator):
     def _matvec(self, x: NDArray) -> NDArray:
         ncp = get_array_module(x)
         y = ncp.zeros((self.nsnr, self.nt), dtype=self.dtype)
+        if self._multishot:
+            if self.dynamic:
+                inputs = (
+                    x.ravel(),
+                    y,
+                    self.nt,
+                    self.ni,
+                    self.dt,
+                    self.vel,
+                    self.trav_srcs,
+                    self.trav_recs,
+                    self.amp_srcs,
+                    self.amp_recs,
+                    self.aperture[0],
+                    self.aperture[1],
+                    self.aperturetap,
+                    self.nz,
+                    self.six,
+                    self.rix,
+                    self.angleaperture[0],
+                    self.angleaperture[1],
+                    self.angle_srcs,
+                    self.angle_recs,
+                    self.nsnr,
+                    self._src_indices,
+                    self._rec_indices,
+                )
+            else:
+                inputs = (
+                    x.ravel(),
+                    y,
+                    self.nt,
+                    self.ni,
+                    self.dt,
+                    self.trav_srcs,
+                    self.trav_recs,
+                    self.nsnr,
+                    self._src_indices,
+                    self._rec_indices,
+                )
+            y = self._kirch_matvec(*inputs)
+            y = self.cop._matvec(y.ravel()).reshape(self.nsnr, self.nt)
+            ypad = ncp.zeros(
+                (self.nshots * self.max_recs, self.nt), dtype=self.dtype
+            )
+            ypad[self._pad_index] = y
+            return ypad
         if self.dynamic and self.travsrcrec:
             inputs = (
                 x.ravel(),
@@ -1171,6 +1607,51 @@ class Kirchhoff(LinearOperator):
     @reshaped
     def _rmatvec(self, x: NDArray) -> NDArray:
         ncp = get_array_module(x)
+        if self._multishot:
+            x = x.reshape(self.nshots * self.max_recs, self.nt)[self._pad_index]
+            x = self.cop._rmatvec(x.ravel()).reshape(self.nsnr, self.nt)
+            y = ncp.zeros(self.ni, dtype=self.dtype)
+            if self.dynamic:
+                inputs = (
+                    x,
+                    y,
+                    self.nt,
+                    self.ni,
+                    self.dt,
+                    self.vel,
+                    self.trav_srcs,
+                    self.trav_recs,
+                    self.amp_srcs,
+                    self.amp_recs,
+                    self.aperture[0],
+                    self.aperture[1],
+                    self.aperturetap,
+                    self.nz,
+                    self.six,
+                    self.rix,
+                    self.angleaperture[0],
+                    self.angleaperture[1],
+                    self.angle_srcs,
+                    self.angle_recs,
+                    self.nsnr,
+                    self._src_indices,
+                    self._rec_indices,
+                )
+            else:
+                inputs = (
+                    x,
+                    y,
+                    self.nt,
+                    self.ni,
+                    self.dt,
+                    self.trav_srcs,
+                    self.trav_recs,
+                    self.nsnr,
+                    self._src_indices,
+                    self._rec_indices,
+                )
+            y = self._kirch_rmatvec(*inputs)
+            return y
         x = self.cop._rmatvec(x.ravel())
         x = x.reshape(self.nsnr, self.nt)
         y = ncp.zeros(self.ni, dtype=self.dtype)
