@@ -196,10 +196,96 @@ axs[1].axis("tight")
 plt.tight_layout()
 
 ###############################################################################
-# In this example the Full Matrix Capture geometry was expressed through the
-# ``shot_recs`` interface purely to showcase the multi-shot API. The real power
-# of ``shot_recs`` lies in *sparse* acquisitions, where each shot records at a
-# different, limited subset of receivers (for example a towed streamer that
-# moves with the source). In that case the data are returned in the compact
-# padded ``(n_shots, max_recs, nt)`` layout, with inactive receiver slots simply
-# left as zeros.
+# Sparse acquisition: zero-offset (pulse-echo) recording
+# ------------------------------------------------------
+# The real power of ``shot_recs`` lies in *sparse* acquisitions, where each shot
+# records at a different, limited subset of receivers. Here we set up a
+# **zero-offset** (monostatic / pulse-echo) survey: since the transmitting and
+# receiving elements are co-located, the only receiver recording shot ``i`` is
+# the one sitting at the source position, i.e. ``shot_recs[i] = [i]``.
+#
+# Each shot therefore contributes a single trace, and the padded data cube
+# collapses to ``(n_shots, 1, nt)`` -- a fraction of the FMC data volume
+# (:math:`n_s` traces instead of :math:`n_s \times n_r`).
+
+shot_recs_zo = [np.array([i]) for i in range(ns)]
+
+Op_zo = Kirchhoff(
+    z,
+    x,
+    t,
+    srcs,
+    recs,
+    v0,
+    wav,
+    wavc,
+    mode="analytic",
+    dynamic=False,
+    shot_recs=shot_recs_zo,
+    engine="numba",
+)
+print(f"zero-offset operator dimsd = {Op_zo.dimsd}  (n_shots, max_recs, nt)")
+
+# forward and adjoint for the zero-offset acquisition
+d_zo = (Op_zo @ refl.ravel()).reshape(Op_zo.dimsd)
+madj_zo = (Op_zo.H @ d_zo.ravel()).reshape(nx, nz)
+
+###############################################################################
+# The single active receiver per shot makes ``d_zo`` a classic zero-offset
+# section: collapsing the trivial receiver axis, ``d_zo[:, 0]`` is an
+# ``(n_shots, nt)`` image in which each scatterer draws a diffraction hyperbola
+# centred on the scatterer's surface position.
+
+zo = d_zo[:, 0]  # (n_shots, nt)
+zomax = np.abs(zo).max()
+plt.figure(figsize=(7, 5))
+plt.imshow(
+    zo[:, itimes].T,
+    cmap="gray",
+    vmin=-zomax,
+    vmax=zomax,
+    extent=(srcs[0, 0], srcs[0, -1], t[itimes][-1], t[0]),
+    aspect="auto",
+)
+plt.xlabel("source = receiver position x [m]")
+plt.ylabel("t [s]")
+plt.title("Zero-offset section (one trace per shot)")
+plt.tight_layout()
+
+###############################################################################
+# Migrating the sparse zero-offset data still recovers the inclusions, though
+# with lower fold than the Full Matrix Capture image: fewer recorded traces mean
+# fewer contributions stacking at each image point.
+
+# sphinx_gallery_thumbnail_number = 4
+fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+axs[0].imshow(refl.T, cmap="gray_r", extent=(x[0], x[-1], z[-1], z[0]), vmin=0, vmax=1)
+axs[0].set_title(r"True reflectivity $m$")
+
+mmax = np.abs(madj).max()
+axs[1].imshow(
+    madj.T, cmap="gray_r", extent=(x[0], x[-1], z[-1], z[0]), vmin=0, vmax=mmax
+)
+axs[1].set_title(r"FMC migration ($n_s \times n_r$ traces)")
+
+zomax = np.abs(madj_zo).max()
+axs[2].imshow(
+    madj_zo.T, cmap="gray_r", extent=(x[0], x[-1], z[-1], z[0]), vmin=0, vmax=zomax
+)
+axs[2].set_title(r"Zero-offset migration ($n_s$ traces)")
+
+for ax in axs:
+    ax.scatter(srcs[0], srcs[1], marker="*", s=40, c="r", edgecolors="k")
+    ax.set_xlabel("x [m]"), ax.set_ylabel("z [m]")
+    ax.axis("tight")
+plt.tight_layout()
+
+###############################################################################
+# The two acquisitions are driven by the exact same operator class; only the
+# ``shot_recs`` lists differ. The Full Matrix Capture survey returns a dense
+# ``(n_shots, n_r, nt)`` cube, while the zero-offset survey returns a compact
+# ``(n_shots, 1, nt)`` cube -- both handled transparently by the padded
+# multi-shot layout. In a more general survey the per-shot receiver counts can
+# vary freely, and the trailing slots of shorter shots are simply left as zeros.
+
+plt.show()
