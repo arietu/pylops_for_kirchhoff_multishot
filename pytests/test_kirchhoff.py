@@ -644,3 +644,105 @@ def test_kirchhoff_multishot_validation():
             z, x, t, s2d, r2d, v0, wav, wavc, y=None,
             shot_recs=good, mode="analytic", engine="cuda",
         )
+
+
+def _byot_amp_tables():
+    """Analytic source/receiver traveltime tables plus geometrical-spreading
+    amplitude tables, for the byot traveltime+amplitude path."""
+    ts, tr, ds, dr, _, _ = Kirchhoff._traveltime_table(
+        z, x, s2d, r2d, v0, mode="analytic"
+    )
+    eps = 1e-2 * (ds.max() + dr.max())
+    asrc = 1.0 / npp.sqrt(ds + eps)
+    arec = 1.0 / npp.sqrt(dr + eps)
+    return ts, tr, asrc, arec
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("TEST_CUPY_PYLOPS", 0)) == 1, reason="Not CuPy enabled"
+)
+@pytest.mark.parametrize("engine", ["numpy", "numba"])
+@pytest.mark.parametrize("multishot", [False, True])
+def test_kirchhoff_byot_amp_dottest(engine, multishot):
+    """Dot-test for byot traveltime+amplitude operator (dense and FMC multishot)."""
+    ts, tr, asrc, arec = _byot_amp_tables()
+    kw = dict(mode="byot", trav=(ts, tr), amp=(asrc, arec), dynamic=False, engine=engine)
+    if multishot:
+        kw["shot_recs"] = [npp.arange(PAR["nrx"]) for _ in range(PAR["nsx"])]
+    Dop = Kirchhoff(z, x, t, s2d, r2d, v0, wav, wavc, y=None, **kw)
+    assert Dop.dimsd == (PAR["nsx"], PAR["nrx"], PAR["nt"])
+    assert dottest(
+        Dop,
+        PAR["nsx"] * PAR["nrx"] * PAR["nt"],
+        PAR["nz"] * PAR["nx"],
+        backend=backend,
+        rtol=1e-6,
+    )
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("TEST_CUPY_PYLOPS", 0)) == 1, reason="Not CuPy enabled"
+)
+def test_kirchhoff_byot_amp_equals_kinematic():
+    """With unit amplitude tables the byot-amplitude path must reduce exactly to
+    the kinematic byot path (no amplitude weighting)."""
+    ts, tr, _, _ = _byot_amp_tables()
+    o1 = npp.ones((PAR["nx"] * PAR["nz"], PAR["nsx"]))
+    o2 = npp.ones((PAR["nx"] * PAR["nz"], PAR["nrx"]))
+    Oamp = Kirchhoff(
+        z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+        mode="byot", trav=(ts, tr), amp=(o1, o2), dynamic=False, engine="numpy",
+    )
+    Okin = Kirchhoff(
+        z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+        mode="byot", trav=(ts, tr), dynamic=False, engine="numpy",
+    )
+    m = npp.random.normal(0, 1, PAR["nx"] * PAR["nz"])
+    assert_array_almost_equal(Oamp * m, Okin * m, decimal=10)
+    assert_array_almost_equal(Oamp.H * (Oamp * m), Okin.H * (Okin * m), decimal=10)
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("TEST_CUPY_PYLOPS", 0)) == 1, reason="Not CuPy enabled"
+)
+def test_kirchhoff_byot_amp_reference():
+    """A single-pixel model isolates the amplitude weighting: each trace of the
+    byot-amplitude forward must equal the kinematic trace scaled by
+    amp_srcs[ii, isrc] * amp_recs[ii, irec]."""
+    ts, tr, asrc, arec = _byot_amp_tables()
+    Oamp = Kirchhoff(
+        z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+        mode="byot", trav=(ts, tr), amp=(asrc, arec), dynamic=False, engine="numpy",
+    )
+    Okin = Kirchhoff(
+        z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+        mode="byot", trav=(ts, tr), dynamic=False, engine="numpy",
+    )
+    ii0 = (PAR["nx"] // 2) * PAR["nz"] + PAR["nz"] // 2
+    m = npp.zeros(PAR["nx"] * PAR["nz"])
+    m[ii0] = 1.0
+    da = (Oamp * m).reshape(PAR["nsx"], PAR["nrx"], PAR["nt"])
+    dk = (Okin * m).reshape(PAR["nsx"], PAR["nrx"], PAR["nt"])
+    for isrc in range(PAR["nsx"]):
+        for irec in range(PAR["nrx"]):
+            scale = asrc[ii0, isrc] * arec[ii0, irec]
+            assert_array_almost_equal(da[isrc, irec], dk[isrc, irec] * scale, decimal=10)
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("TEST_CUPY_PYLOPS", 0)) == 1, reason="Not CuPy enabled"
+)
+def test_kirchhoff_byot_amp_validation():
+    """A single (combined) traveltime table cannot be combined with amplitude
+    tables."""
+    ts, tr, asrc, arec = _byot_amp_tables()
+    trav_single = ts.reshape(PAR["nx"] * PAR["nz"], PAR["nsx"], 1) + tr.reshape(
+        PAR["nx"] * PAR["nz"], 1, PAR["nrx"]
+    )
+    trav_single = trav_single.reshape(PAR["nx"] * PAR["nz"], PAR["nsx"] * PAR["nrx"])
+    with pytest.raises(NotImplementedError, match="separate traveltime tables"):
+        Kirchhoff(
+            z, x, t, s2d, r2d, v0, wav, wavc, y=None,
+            mode="byot", trav=trav_single, amp=(asrc, arec), dynamic=False,
+            engine="numpy",
+        )

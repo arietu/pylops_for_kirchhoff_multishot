@@ -6,6 +6,11 @@ Changelog
   via the `shot_recs` parameter, allowing each shot to record at a
   shot-specific subset of receivers (padded `(n_shots, max_recs, nt)` data
   layout). Supported for the `numpy` and `numba` engines.
+* Extended `pylops.waveeqprocessing.Kirchhoff` `mode='byot'` to accept
+  user-supplied amplitude tables `amp=(amp_srcs, amp_recs)` with
+  `dynamic=False`: the amplitudes are applied directly (product per image
+  point, no opening-angle/velocity/aperture scaling), including for the
+  multi-shot/FMC geometry. Supported for the `numpy` and `numba` engines.
 
 # 2.7.0
 * Added cubic spline interpolation operator via

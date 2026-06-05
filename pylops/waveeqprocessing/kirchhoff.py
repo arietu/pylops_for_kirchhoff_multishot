@@ -91,8 +91,13 @@ class Kirchhoff(LinearOperator):
         .. versionadded:: 2.0.0
 
         Pair of amplitude tables of size :math:`\lbrack (n_y) n_x n_z \times n_s \rbrack` and
-        :math:`\lbrack (n_y) n_x n_z \times n_r \rbrack` (to be provided if ``mode='byot'``). Note that this parameter
-        is only required when ``mode='dynamic'`` is chosen.
+        :math:`\lbrack (n_y) n_x n_z \times n_r \rbrack` (to be provided if ``mode='byot'``). When
+        ``dynamic=True`` these tables feed the dynamic amplitude model (combined with the opening-angle
+        and velocity scaling). When ``dynamic=False`` they are instead applied *directly*: the weight at
+        image point :math:`\mathbf{x}` for a given source-receiver pair is the product
+        ``amp_srcs[x, src] * amp_recs[x, rec]``, with no opening-angle, velocity, or aperture scaling. This
+        is useful to supply pre-computed Green's function amplitudes alongside the traveltime tables. If not
+        provided (and ``dynamic=False``), no amplitude weighting is applied.
     aperture : :obj:`float` or :obj:`tuple`, optional
         .. versionadded:: 2.0.0
 
@@ -451,6 +456,7 @@ class Kirchhoff(LinearOperator):
 
         # compute traveltime and distances
         self.travsrcrec = True  # use separate tables for src and rec traveltimes
+        self._rawamp = False  # user-supplied amplitude tables applied directly
         if mode in ["analytic", "eikonal", "byot"]:
             if mode in ["analytic", "eikonal"]:
                 # compute traveltime table
@@ -511,6 +517,14 @@ class Kirchhoff(LinearOperator):
                             self.trav_recs.reshape(*dims, nr),
                             axis=np.arange(self.ndims),
                         )
+                elif isinstance(amp, tuple):
+                    # user-supplied amplitude tables applied directly (no angle/
+                    # velocity/aperture scaling); requires separate src/rec tables
+                    if not self.travsrcrec:
+                        msg = "amp tuple requires separate traveltime tables (trav must be a tuple of source and receiver tables)"
+                        raise NotImplementedError(msg)
+                    self.amp_srcs, self.amp_recs = amp
+                    self._rawamp = True
         else:
             msg = f"mode must be either 'analytic', 'eikonal' or 'byot', got {mode}"
             raise ValueError(msg)
@@ -1223,6 +1237,137 @@ class Kirchhoff(LinearOperator):
         return y
 
     @staticmethod
+    def _ampsrcrec_byot_kirch_matvec(
+        x: NDArray,
+        y: NDArray,
+        ns: int,
+        nr: int,
+        nt: int,
+        ni: int,
+        dt: float,
+        trav_srcs: NDArray,
+        trav_recs: NDArray,
+        amp_srcs: NDArray,
+        amp_recs: NDArray,
+    ) -> NDArray:
+        for isrc in prange(ns):
+            travisrc = trav_srcs[:, isrc]
+            ampisrc = amp_srcs[:, isrc]
+            for irec in range(nr):
+                travirec = trav_recs[:, irec]
+                trav = travisrc + travirec
+                itrav = (trav / dt).astype("int32")
+                travd = trav / dt - itrav
+                amp = ampisrc * amp_recs[:, irec]
+                for ii in range(ni):
+                    itravii = itrav[ii]
+                    travdii = travd[ii]
+                    ampii = amp[ii]
+                    if 0 <= itravii < nt - 1:
+                        y[isrc * nr + irec, itravii] += x[ii] * (1 - travdii) * ampii
+                        y[isrc * nr + irec, itravii + 1] += x[ii] * travdii * ampii
+        return y
+
+    @staticmethod
+    def _ampsrcrec_byot_kirch_rmatvec(
+        x: NDArray,
+        y: NDArray,
+        ns: int,
+        nr: int,
+        nt: int,
+        ni: int,
+        dt: float,
+        trav_srcs: NDArray,
+        trav_recs: NDArray,
+        amp_srcs: NDArray,
+        amp_recs: NDArray,
+    ) -> NDArray:
+        for ii in prange(ni):
+            trav_srcsii = trav_srcs[ii]
+            trav_recsii = trav_recs[ii]
+            amp_srcsii = amp_srcs[ii]
+            amp_recsii = amp_recs[ii]
+            for isrc in range(ns):
+                trav_srcii = trav_srcsii[isrc]
+                amp_srcii = amp_srcsii[isrc]
+                for irec in range(nr):
+                    travii = trav_srcii + trav_recsii[irec]
+                    itravii = int(travii / dt)
+                    travdii = travii / dt - itravii
+                    ampii = amp_srcii * amp_recsii[irec]
+                    if 0 <= itravii < nt - 1:
+                        y[ii] += (
+                            x[isrc * nr + irec, itravii] * (1 - travdii)
+                            + x[isrc * nr + irec, itravii + 1] * travdii
+                        ) * ampii
+        return y
+
+    @staticmethod
+    def _ampsrcrec_byot_shots_kirch_matvec(
+        x: NDArray,
+        y: NDArray,
+        nt: int,
+        ni: int,
+        dt: float,
+        trav_srcs: NDArray,
+        trav_recs: NDArray,
+        amp_srcs: NDArray,
+        amp_recs: NDArray,
+        ntrace: int,
+        src_indices: NDArray,
+        rec_indices: NDArray,
+    ) -> NDArray:
+        for itrace in prange(ntrace):
+            isrc = src_indices[itrace]
+            irec = rec_indices[itrace]
+            trav = trav_srcs[:, isrc] + trav_recs[:, irec]
+            itrav = (trav / dt).astype("int32")
+            travd = trav / dt - itrav
+            amp = amp_srcs[:, isrc] * amp_recs[:, irec]
+            for ii in range(ni):
+                itravii = itrav[ii]
+                travdii = travd[ii]
+                ampii = amp[ii]
+                if 0 <= itravii < nt - 1:
+                    y[itrace, itravii] += x[ii] * (1 - travdii) * ampii
+                    y[itrace, itravii + 1] += x[ii] * travdii * ampii
+        return y
+
+    @staticmethod
+    def _ampsrcrec_byot_shots_kirch_rmatvec(
+        x: NDArray,
+        y: NDArray,
+        nt: int,
+        ni: int,
+        dt: float,
+        trav_srcs: NDArray,
+        trav_recs: NDArray,
+        amp_srcs: NDArray,
+        amp_recs: NDArray,
+        ntrace: int,
+        src_indices: NDArray,
+        rec_indices: NDArray,
+    ) -> NDArray:
+        for ii in prange(ni):
+            trav_srcsii = trav_srcs[ii]
+            trav_recsii = trav_recs[ii]
+            amp_srcsii = amp_srcs[ii]
+            amp_recsii = amp_recs[ii]
+            for itrace in range(ntrace):
+                isrc = src_indices[itrace]
+                irec = rec_indices[itrace]
+                travii = trav_srcsii[isrc] + trav_recsii[irec]
+                itravii = int(travii / dt)
+                travdii = travii / dt - itravii
+                ampii = amp_srcsii[isrc] * amp_recsii[irec]
+                if 0 <= itravii < nt - 1:
+                    y[ii] += (
+                        x[itrace, itravii] * (1 - travdii)
+                        + x[itrace, itravii + 1] * travdii
+                    ) * ampii
+        return y
+
+    @staticmethod
     def _ampsrcrec_kirch_matvec(
         x: NDArray,
         y: NDArray,
@@ -1449,6 +1594,9 @@ class Kirchhoff(LinearOperator):
         if self._multishot and engine == "cuda":
             msg = "engine='cuda' is not supported together with shot_recs; use engine='numpy' or 'numba'"
             raise NotImplementedError(msg)
+        if self._rawamp and engine == "cuda":
+            msg = "engine='cuda' is not supported with byot amplitude tables (dynamic=False with amp); use engine='numpy' or 'numba'"
+            raise NotImplementedError(msg)
         if engine == "numba" and jit_message is None:
             numba_opts = dict(
                 nopython=True, nogil=True, parallel=parallel
@@ -1460,6 +1608,13 @@ class Kirchhoff(LinearOperator):
                 self._kirch_rmatvec = jit(**numba_opts)(
                     self._ampsrcrec_shots_kirch_rmatvec
                 )
+            elif self._multishot and self._rawamp:
+                self._kirch_matvec = jit(**numba_opts)(
+                    self._ampsrcrec_byot_shots_kirch_matvec
+                )
+                self._kirch_rmatvec = jit(**numba_opts)(
+                    self._ampsrcrec_byot_shots_kirch_rmatvec
+                )
             elif self._multishot:
                 self._kirch_matvec = jit(**numba_opts)(
                     self._travsrcrec_shots_kirch_matvec
@@ -1470,6 +1625,13 @@ class Kirchhoff(LinearOperator):
             elif self.dynamic and self.travsrcrec:
                 self._kirch_matvec = jit(**numba_opts)(self._ampsrcrec_kirch_matvec)
                 self._kirch_rmatvec = jit(**numba_opts)(self._ampsrcrec_kirch_rmatvec)
+            elif self._rawamp and self.travsrcrec:
+                self._kirch_matvec = jit(**numba_opts)(
+                    self._ampsrcrec_byot_kirch_matvec
+                )
+                self._kirch_rmatvec = jit(**numba_opts)(
+                    self._ampsrcrec_byot_kirch_rmatvec
+                )
             elif self.travsrcrec:
                 self._kirch_matvec = jit(**numba_opts)(self._travsrcrec_kirch_matvec)
                 self._kirch_rmatvec = jit(**numba_opts)(self._travsrcrec_kirch_rmatvec)
@@ -1496,12 +1658,18 @@ class Kirchhoff(LinearOperator):
             if self._multishot and self.dynamic:
                 self._kirch_matvec = self._ampsrcrec_shots_kirch_matvec
                 self._kirch_rmatvec = self._ampsrcrec_shots_kirch_rmatvec
+            elif self._multishot and self._rawamp:
+                self._kirch_matvec = self._ampsrcrec_byot_shots_kirch_matvec
+                self._kirch_rmatvec = self._ampsrcrec_byot_shots_kirch_rmatvec
             elif self._multishot:
                 self._kirch_matvec = self._travsrcrec_shots_kirch_matvec
                 self._kirch_rmatvec = self._travsrcrec_shots_kirch_rmatvec
             elif self.dynamic and self.travsrcrec:
                 self._kirch_matvec = self._ampsrcrec_kirch_matvec
                 self._kirch_rmatvec = self._ampsrcrec_kirch_rmatvec
+            elif self._rawamp and self.travsrcrec:
+                self._kirch_matvec = self._ampsrcrec_byot_kirch_matvec
+                self._kirch_rmatvec = self._ampsrcrec_byot_kirch_rmatvec
             elif self.travsrcrec:
                 self._kirch_matvec = self._travsrcrec_kirch_matvec
                 self._kirch_rmatvec = self._travsrcrec_kirch_rmatvec
@@ -1536,6 +1704,21 @@ class Kirchhoff(LinearOperator):
                     self.angleaperture[1],
                     self.angle_srcs,
                     self.angle_recs,
+                    self.nsnr,
+                    self._src_indices,
+                    self._rec_indices,
+                )
+            elif self._rawamp:
+                inputs = (
+                    x.ravel(),
+                    y,
+                    self.nt,
+                    self.ni,
+                    self.dt,
+                    self.trav_srcs,
+                    self.trav_recs,
+                    self.amp_srcs,
+                    self.amp_recs,
                     self.nsnr,
                     self._src_indices,
                     self._rec_indices,
@@ -1584,6 +1767,20 @@ class Kirchhoff(LinearOperator):
                 self.angleaperture[1],
                 self.angle_srcs,
                 self.angle_recs,
+            )
+        elif self._rawamp and self.travsrcrec:
+            inputs = (
+                x.ravel(),
+                y,
+                self.ns,
+                self.nr,
+                self.nt,
+                self.ni,
+                self.dt,
+                self.trav_srcs,
+                self.trav_recs,
+                self.amp_srcs,
+                self.amp_recs,
             )
         elif self.travsrcrec:
             inputs = (
@@ -1637,6 +1834,21 @@ class Kirchhoff(LinearOperator):
                     self._src_indices,
                     self._rec_indices,
                 )
+            elif self._rawamp:
+                inputs = (
+                    x,
+                    y,
+                    self.nt,
+                    self.ni,
+                    self.dt,
+                    self.trav_srcs,
+                    self.trav_recs,
+                    self.amp_srcs,
+                    self.amp_recs,
+                    self.nsnr,
+                    self._src_indices,
+                    self._rec_indices,
+                )
             else:
                 inputs = (
                     x,
@@ -1679,6 +1891,20 @@ class Kirchhoff(LinearOperator):
                 self.angleaperture[1],
                 self.angle_srcs,
                 self.angle_recs,
+            )
+        elif self._rawamp and self.travsrcrec:
+            inputs = (
+                x,
+                y,
+                self.ns,
+                self.nr,
+                self.nt,
+                self.ni,
+                self.dt,
+                self.trav_srcs,
+                self.trav_recs,
+                self.amp_srcs,
+                self.amp_recs,
             )
         elif self.travsrcrec:
             inputs = (
