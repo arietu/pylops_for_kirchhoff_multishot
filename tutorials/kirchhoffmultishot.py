@@ -57,7 +57,7 @@ for ix, iz in inclusions:
 # Full Matrix Capture acquisition the transmitting and receiving elements
 # coincide, so sources and receivers share the same positions.
 
-narr = 21  # number of array elements
+narr = 64  # number of array elements
 ax_ = np.linspace(10 * dx, (nx - 10) * dx, narr)
 az = np.full(narr, dz)  # just below the surface
 
