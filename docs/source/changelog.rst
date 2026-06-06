@@ -13,6 +13,11 @@ Version 2.8.0
   via the ``shot_recs`` parameter, allowing each shot to record at a
   shot-specific subset of receivers (padded ``(n_shots, max_recs, nt)`` data
   layout). Supported for the ``numpy`` and ``numba`` engines.
+* Extended :py:class:`pylops.waveeqprocessing.Kirchhoff` ``mode='byot'`` to accept
+  user-supplied amplitude tables ``amp=(amp_srcs, amp_recs)`` with ``dynamic=False``:
+  the amplitudes are applied directly (product per image point, no
+  opening-angle/velocity/aperture scaling), including for the multi-shot/FMC
+  geometry. Supported for the ``numpy`` and ``numba`` engines.
 
 
 Version 2.7.0
