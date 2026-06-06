@@ -42,27 +42,27 @@ np.random.seed(0)
 # times.
 
 # Spatial axes
-nx, nz = 81, 61
+nx, nz = 51, 31
 dx, dz = 4.0, 4.0
 x, z = np.arange(nx) * dx, np.arange(nz) * dz
 v0 = 1000.0  # constant background velocity [m/s]
 
 # Reflectivity model: a few small reflective inclusions
 refl = np.zeros((nx, nz))
-inclusions = [(20, 18), (38, 40), (58, 22), (30, 50), (50, 48)]
+inclusions = [(13, 10), (24, 20), (37, 12), (18, 25), (32, 24)]
 for ix, iz in inclusions:
     refl[ix - 1 : ix + 1, iz - 1 : iz + 1] = 1.0
 
 # Surface FMC array (sources and receivers co-located)
-narr = 12
-ax_ = np.linspace(10 * dx, (nx - 10) * dx, narr)
+narr = 10
+ax_ = np.linspace(8 * dx, (nx - 8) * dx, narr)
 az = np.full(narr, dz)
 srcs = np.vstack((ax_, az))
 recs = np.vstack((ax_, az))
 ns, nr = srcs.shape[1], recs.shape[1]
 
 # Time axis and wavelet
-nt = 400
+nt = 300
 dt = 0.004
 t = np.arange(nt) * dt
 wav, _, wavc = ricker(t[:41], f0=20)
@@ -95,7 +95,7 @@ d = Op @ refl.ravel()
 
 madj = (Op.H @ d).reshape(nx, nz)
 
-minv_ls = lsqr(Op, d, iter_lim=80, atol=0, btol=0, show=True)[0].reshape(nx, nz)
+minv_ls = lsqr(Op, d, iter_lim=30, atol=0, btol=0)[0].reshape(nx, nz)
 
 
 ###############################################################################
@@ -114,12 +114,12 @@ def rel_error(m):
 # range of regularization strengths :math:`\epsilon` (fixed iteration budget)
 # and keep the value that minimises the reconstruction error.
 
-niter = 80
-epss = np.logspace(-1, 2.0, 5)
+niter = 40
+epss = np.logspace(0, 3.0, 4)
 errs = np.zeros_like(epss)
 models = []
 for i, eps in enumerate(epss):
-    minv = fista(Op, d, niter=niter, eps=eps, show=True)[0].reshape(nx, nz)
+    minv = fista(Op, d, niter=niter, eps=eps)[0].reshape(nx, nz)
     models.append(minv)
     errs[i] = rel_error(minv)
 
