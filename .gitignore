@@ -53,3 +53,6 @@ benchmarks/
 
 # Virtual Environments
 .venv**
+
+# Large regenerable simulation outputs (figures are tracked, raw arrays are not)
+outputs/**/results.npz
