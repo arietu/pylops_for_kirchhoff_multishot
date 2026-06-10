@@ -13,6 +13,11 @@ The migration velocity is the *same* three-layer model used by deepwave **but
 without the air voids** (the voids are the scatterers we want to image; the
 background velocity should not know about them).
 
+This variant additionally applies the **signal envelope** (instantaneous
+amplitude via the Hilbert transform) to each trace *before* migration, and
+compares migrating the raw signals against migrating their envelopes. The
+recorded signals (raw and envelope) are plotted alongside the reconstructions.
+
 Because Python 3.14 has no ``scikit-fmm`` wheel and no C++ compiler is available
 here, the layered-model traveltime tables are computed with a small **numba
 fast-sweeping eikonal solver** and handed to ``Kirchhoff`` through
@@ -31,6 +36,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from numba import njit, prange
+from scipy.signal import hilbert
 
 import deepwave
 from deepwave import scalar
@@ -40,7 +46,7 @@ from pylops.utils.wavelets import ricker
 from pylops.waveeqprocessing.kirchhoff import Kirchhoff
 
 np.random.seed(0)
-OUTDIR = os.path.join("outputs", "deepwave_fmc_single")
+OUTDIR = os.path.join("outputs", "deepwave_fmc_single_envelope")
 os.makedirs(OUTDIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -283,6 +289,25 @@ madj_mut = migrate(fmc_mut)
 madj_sct = migrate(fmc_sct)
 
 # ---------------------------------------------------------------------------
+# 6c. Envelope (instantaneous amplitude) of each conditioned dataset, applied
+# trace-by-trace via the Hilbert transform BEFORE migration. Enveloping removes
+# the oscillatory wavelet and polarity, leaving a single positive lobe at each
+# arrival: migration becomes insensitive to wavelet phase / polarity (no
+# sidelobe ringing in the image) at the cost of spatial resolution.
+# ---------------------------------------------------------------------------
+def envelope(data):
+    return np.abs(hilbert(data, axis=-1))
+
+
+fmc_tot_e = envelope(fmc_tot)
+fmc_mut_e = envelope(fmc_mut)
+fmc_sct_e = envelope(fmc_sct)
+
+madj_tot_e = migrate(fmc_tot_e)
+madj_mut_e = migrate(fmc_mut_e)
+madj_sct_e = migrate(fmc_sct_e)
+
+# ---------------------------------------------------------------------------
 # 7. multishot == VStack equality (operator property, checked on scattered data)
 # ---------------------------------------------------------------------------
 madj_sct_vs = (Op_vs.H @ fmc_sct.ravel()).reshape(nxm, nzm)
@@ -354,18 +379,23 @@ rec_idx = [min(ishot + int(o), nr - 1) for o in rec_offsets_mm]
 
 fig, axs = plt.subplots(1, 2, figsize=(13, 6))
 
-# left: several A-scans at increasing offset (each trace normalised, stacked)
+# left: several A-scans at increasing offset (raw signal + its envelope)
 ax = axs[0]
 for k, j in enumerate(rec_idx):
     tr = fmc[ishot, j]
-    tr = tr / (np.abs(tr).max() + 1e-30)
+    nrm = np.abs(tr).max() + 1e-30
+    env = np.abs(hilbert(tr)) / nrm
+    tr = tr / nrm
     off = j - ishot
-    ax.plot(t_us, tr + 2.5 * k, lw=0.8)
-    ax.text(t_us[-1], 2.5 * k + 0.3, f"offset {off} mm", ha="right", fontsize=9)
+    lr, = ax.plot(t_us, tr + 2.5 * k, lw=0.7, color=f"C{k}")
+    le, = ax.plot(t_us, env + 2.5 * k, lw=1.4, color="k", alpha=0.7)
+    ax.text(t_us[-1], 2.5 * k + 0.5, f"offset {off} mm", ha="right", fontsize=9)
 for name, te in events.items():
     ax.axvline(te, color="gray", ls="--", lw=0.8)
     ax.text(te, 2.5 * len(rec_idx) - 0.5, name, rotation=90,
             va="top", ha="right", fontsize=8, color="gray")
+ax.legend([lr, le], ["raw signal", "envelope (Hilbert)"], loc="upper left",
+          fontsize=9)
 ax.set_title(f"A-scans, shot #{ishot} (element over void), increasing offset")
 ax.set_xlabel("t [us]"), ax.set_ylabel("normalised amplitude + offset")
 ax.set_yticks([])
@@ -378,36 +408,45 @@ for name, te in events.items():
     ax.axvline(te, color="gray", ls="--", lw=0.8)
     ax.text(te, 1.0, name, rotation=90, va="top", ha="right", fontsize=8,
             color="gray", transform=ax.get_xaxis_transform())
-l1, = ax.plot(t_us, pe_tot, "C0", lw=0.9, label="total field")
+l1, = ax.plot(t_us, pe_tot, "C0", lw=0.8, label="total field")
+l1e, = ax.plot(t_us, np.abs(hilbert(pe_tot)), "C0", ls="--", lw=1.2,
+               label="total envelope")
 ax.set_xlabel("t [us]"), ax.set_ylabel("total-field amplitude", color="C0")
 ax.tick_params(axis="y", labelcolor="C0")
 ax2 = ax.twinx()
 scale = np.abs(pe_tot).max() / (np.abs(pe_sct).max() + 1e-30)
-l2, = ax2.plot(t_us, pe_sct, "C3", lw=0.9,
+l2, = ax2.plot(t_us, pe_sct, "C3", lw=0.8,
                label=f"scattered field (~{scale:.0f}x smaller)")
+l2e, = ax2.plot(t_us, np.abs(hilbert(pe_sct)), "C3", ls="--", lw=1.2,
+                label="scattered envelope")
 ax2.set_ylabel("scattered-field amplitude", color="C3")
 ax2.tick_params(axis="y", labelcolor="C3")
 ax.set_title(f"Pulse-echo trace (shot=rec #{ishot}): total vs scattered")
-ax.legend([l1, l2], [l1.get_label(), l2.get_label()], loc="upper right",
-          fontsize=9)
+ax.legend([l1, l1e, l2, l2e],
+          [ln.get_label() for ln in (l1, l1e, l2, l2e)],
+          loc="upper right", fontsize=8)
 fig.tight_layout()
 fig.savefig(os.path.join(OUTDIR, "representative_traces.png"), dpi=130)
 
-# (c) three-way migration comparison (each on its own amplitude scale)
-fig, axs = plt.subplots(1, 3, figsize=(17, 5))
-for a, img, title in zip(
-    axs,
-    [madj_tot, madj_mut, madj_sct],
-    ["(1) total field (raw)", "(2) direct-mute + t$^2$ gain",
-     "(3) reference-subtracted (scattered)"],
-):
-    mmax = np.percentile(np.abs(img), 99.8)
-    a.imshow(img.T, cmap="gray_r", extent=ext_mig, aspect="equal",
-             vmin=-mmax, vmax=mmax)
-    a.set_title(title)
-    mark(a)
-fig.suptitle("Kirchhoff migration of deepwave FMC data "
-             "(green = true voids) -- effect of data conditioning")
+# (c) migration comparison: raw signals (top) vs envelope signals (bottom),
+# for the three data conditionings (each panel on its own amplitude scale).
+col_titles = ["(1) total field", "(2) direct-mute + t$^2$ gain",
+              "(3) reference-subtracted"]
+rows = [("migrated from raw signals", [madj_tot, madj_mut, madj_sct]),
+        ("migrated from envelopes", [madj_tot_e, madj_mut_e, madj_sct_e])]
+fig, axs = plt.subplots(2, 3, figsize=(17, 9))
+for r, (row_label, imgs) in enumerate(rows):
+    for c, img in enumerate(imgs):
+        a = axs[r, c]
+        mmax = np.percentile(np.abs(img), 99.8)
+        a.imshow(img.T, cmap="gray_r", extent=ext_mig, aspect="equal",
+                 vmin=-mmax, vmax=mmax)
+        mark(a)
+        if r == 0:
+            a.set_title(col_titles[c])
+    axs[r, 0].set_ylabel(f"{row_label}\nz [mm]")
+fig.suptitle("Kirchhoff migration of deepwave FMC data (green = true void) -- "
+             "data conditioning (cols) x raw vs envelope (rows)")
 fig.tight_layout()
 fig.savefig(os.path.join(OUTDIR, "migration_compare.png"), dpi=130)
 
@@ -416,6 +455,7 @@ np.savez_compressed(
     vel_true=vel_true, vel_mig=vel_mig,
     fmc=fmc.astype(np.float32), fmc_scat=fmc_scat.astype(np.float32),
     madj_tot=madj_tot, madj_mut=madj_mut, madj_sct=madj_sct,
+    madj_tot_e=madj_tot_e, madj_mut_e=madj_mut_e, madj_sct_e=madj_sct_e,
     xm=xm, zm=zm, elem_x=elem_x, elem_z=elem_z,
     void_centers=np.array(centers), t=t,
 )
