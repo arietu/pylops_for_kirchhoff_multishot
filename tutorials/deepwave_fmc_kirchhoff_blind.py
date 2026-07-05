@@ -12,22 +12,28 @@ side only knows:
 1. the recorded receiver signals,
 2. the array geometry and the background velocity, and
 3. traveltime + amplitude tables obtained from the pylops
-   :py:class:`pylops.waveeqprocessing.Kirchhoff` operator itself
-   (``Kirchhoff._traveltime_table``), handed back to the operator through
-   ``mode="byot"`` as ``trav=(trav_srcs, trav_recs)`` and
-   ``amp=(amp_srcs, amp_recs)`` tuples.
+   :py:class:`pylops.waveeqprocessing.Kirchhoff` operator itself, handed back
+   to the operator through ``mode="byot"`` as ``trav`` and ``amp`` tuples
+   (see :func:`fmc_blind_utils.byot_tables`).
 
 Because the raw total field is dominated by the direct wave along the array
-and the plate back-wall echo, the focus is on **data-driven preprocessing**:
+and the plate back-wall echo, the focus is on **data-driven preprocessing**
+(the chain lives in :mod:`fmc_blind_utils`, shared by all four blind studies):
 
+* time-zero correction for the known excitation delay;
 * zero-phase bandpass around the transducer band;
 * **common-offset median subtraction** -- for each source-receiver offset the
   median trace over all element pairs is removed. In a laterally invariant
   plate this cancels the direct wave, the back-wall echo and their multiples,
   while the void diffraction (localised in x) survives. This is the standard
   "no reference" alternative to Born reference subtraction;
-* a direct-wave top mute built only from the known velocity and geometry;
+* a direct-wave top mute + back-wall inspection gate built only from the known
+  velocity and geometry;
 * a linear time gain compensating geometrical spreading of the data.
+
+Before imaging, the fork's byot + raw-amplitude Kirchhoff code path is
+validated against an independently assembled VStack of per-shot operators
+(:func:`fmc_blind_utils.crosscheck_byot_operator`).
 
 Outputs (PNG figures + ``results.npz``) go to ``outputs/deepwave_fmc_blind/``.
 """
@@ -39,15 +45,23 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-from scipy.signal import butter, hilbert, sosfiltfilt
-
-from deepwave import scalar
+from scipy.signal import hilbert
 
 from pylops.utils.wavelets import ricker
 from pylops.waveeqprocessing.kirchhoff import Kirchhoff
 
-np.random.seed(0)
+from fmc_blind_utils import (
+    CONTACT,
+    byot_tables,
+    bandpass,
+    common_offset_median_subtract,
+    contact_gate_times,
+    cosine_gate_cube,
+    crosscheck_byot_operator,
+    simulate_fmc,
+    time_zero_correct,
+)
+
 OUTDIR = os.path.join("outputs", "deepwave_fmc_blind")
 os.makedirs(OUTDIR, exist_ok=True)
 
@@ -57,15 +71,13 @@ os.makedirs(OUTDIR, exist_ok=True)
 # Simulation grid in (nx, nz) layout (pylops convention); deepwave gets the
 # transpose. At 5 MHz the aluminum wavelength is 1.26 mm, so the 0.05 mm grid
 # gives ~25 points per wavelength.
-dx = 0.5e-4  # 0.05 mm grid spacing [m]
-nx_s, nz_s = 800, 600  # 40 mm x 30 mm
+C = CONTACT
+dx, nx_s, nz_s = C.dx, C.nx, C.nz
 xs = np.arange(nx_s) * dx
 zs = np.arange(nz_s) * dx
 
-V_ALU, V_AIR = 6300.0, 343.0
-FREQ = 5.0e6
+V_ALU, V_AIR, FREQ, Z_BACK = C.v_alu, C.v_air, C.freq, C.z_back
 LAM_ALU = V_ALU / FREQ  # 1.26 mm
-Z_BACK = 0.024  # plate back wall at 24 mm depth (air below)
 
 vel_true = np.full((nx_s, nz_s), V_ALU, dtype=np.float32)
 vel_true[:, zs >= Z_BACK] = V_AIR
@@ -81,55 +93,20 @@ print(f"void diameter = {2 * void_r * 1e3:.2f} mm "
 # ---------------------------------------------------------------------------
 # 2. FMC acquisition geometry (32 elements, 1 mm pitch, inside the aluminum)
 # ---------------------------------------------------------------------------
-n_el = 32
-pitch_cells = 20  # 1 mm pitch
-x0_cells = 90  # first element at x = 4.5 mm
-z_cells = 40  # element depth = 2 mm
-elem_ix = x0_cells + np.arange(n_el) * pitch_cells
-elem_iz = np.full(n_el, z_cells)
+n_el = C.n_el
+elem_ix = C.x0_cells + np.arange(n_el) * C.pitch_cells  # 1 mm pitch, x0=4.5 mm
+elem_iz = np.full(n_el, C.z_cells)  # element depth = 2 mm
 elem_x = elem_ix * dx
 elem_z = elem_iz * dx
 
 # ---------------------------------------------------------------------------
 # 3. ONE deepwave simulation of the true medium (the only data we get)
 # ---------------------------------------------------------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"deepwave device: {device}")
-
-dt = 5.0e-9  # 5 ns -> Courant 0.63 at 6300 m/s
-nt = 2200  # 11 us record
+dt, nt = C.dt, C.nt  # 5 ns (Courant 0.63 at 6300 m/s), 11 us record
 peak_time = 1.5 / FREQ
 
-import deepwave  # noqa: E402  (wavelet helper)
-
-src_amp = (
-    deepwave.wavelets.ricker(FREQ, nt, dt, peak_time)
-    .reshape(1, 1, -1)
-    .repeat(n_el, 1, 1)
-    .to(device)
-)
-src_loc = torch.tensor(
-    np.stack([elem_iz, elem_ix], axis=-1)[:, None, :], dtype=torch.long, device=device
-)
-rec_loc = torch.tensor(
-    np.broadcast_to(np.stack([elem_iz, elem_ix], axis=-1), (n_el, n_el, 2)).copy(),
-    dtype=torch.long,
-    device=device,
-)
-
 t0 = time.perf_counter()
-out = scalar(
-    torch.tensor(vel_true.T.copy(), device=device),
-    dx,
-    dt,
-    source_amplitudes=src_amp,
-    source_locations=src_loc,
-    receiver_locations=rec_loc,
-    accuracy=4,
-    pml_width=20,
-    pml_freq=FREQ,
-)
-fmc_raw = out[-1].cpu().numpy().astype(np.float64)  # (n_src, n_rec, nt)
+fmc_raw = simulate_fmc(vel_true, dx, dt, nt, elem_ix, elem_iz, FREQ, peak_time)
 print(f"deepwave FMC sim: {time.perf_counter() - t0:.1f} s, data {fmc_raw.shape}")
 
 t = np.arange(nt) * dt
@@ -141,47 +118,22 @@ t = np.arange(nt) * dt
 # electrical time zero (always known in a real system), so advance the data to
 # make the recorded traveltimes match the impulse-response times the Kirchhoff
 # operator works with.
-n0 = int(round(peak_time / dt))
-fmc_t0 = np.concatenate(
-    [fmc_raw[..., n0:], np.zeros((n_el, n_el, n0))], axis=-1
-)
+fmc_t0 = time_zero_correct(fmc_raw, peak_time, dt)
 
 # (b) zero-phase bandpass around the 5 MHz transducer band
-sos = butter(4, [2.5e6, 7.5e6], btype="bandpass", fs=1.0 / dt, output="sos")
-fmc_bp = sosfiltfilt(sos, fmc_t0, axis=-1)
+fmc_bp = bandpass(fmc_t0, dt)
 
-# (c) common-offset median subtraction: at fixed element offset k = j - i the
-# direct wave, back-wall echo and their multiples are identical for every i
-# (laterally invariant plate), so the median trace over i estimates exactly
-# those events and none of the localised void diffraction. Offsets with too few
-# pairs for a robust median are zeroed (a tiny aperture loss) so their
-# unsubtracted back-wall echo cannot leak artefacts into the image.
-fmc_cos = fmc_bp.copy()
-MIN_PAIRS = 4
-for k in range(-(n_el - 1), n_el):
-    ii = np.arange(max(0, -k), min(n_el, n_el - k))
-    if len(ii) < MIN_PAIRS:
-        fmc_cos[ii, ii + k, :] = 0.0
-        continue
-    med = np.median(fmc_bp[ii, ii + k, :], axis=0)
-    fmc_cos[ii, ii + k, :] -= med
+# (c) common-offset median subtraction (see fmc_blind_utils for the rationale)
+fmc_cos = common_offset_median_subtract(fmc_bp)
 
 # (d) time gates from geometry + velocity only, with cosine ramps: a top mute
 # just after the direct wave along the array, and a bottom gate just before the
 # back-wall echo (the NDT "inspection gate" -- the plate thickness is known, and
 # everything at/after the back-wall arrival is wall echo and multiples).
-T_PAD = 0.9e-6
+T_PAD = 0.9e-6  # clear the long in-solid direct-wave coda (~4.5 periods)
 T_RAMP = 0.3e-6
-h_bw = 2.0 * (Z_BACK - elem_z[0])  # two-way vertical path to the back wall
-mute = np.ones((n_el, n_el, nt))
-for i in range(n_el):
-    offs = np.abs(elem_x - elem_x[i])
-    t_dir = offs / V_ALU + T_PAD
-    t_bw = np.sqrt(h_bw**2 + offs**2) / V_ALU - 0.4e-6
-    for j in range(n_el):
-        up = np.clip((t - t_dir[j]) / T_RAMP, 0.0, 1.0)
-        dn = np.clip((t_bw[j] - t) / T_RAMP, 0.0, 1.0)
-        mute[i, j] = (0.5 - 0.5 * np.cos(np.pi * up)) * (0.5 - 0.5 * np.cos(np.pi * dn))
+t_open, t_close = contact_gate_times(elem_x, elem_z, V_ALU, Z_BACK, T_PAD)
+mute = cosine_gate_cube(t, t_open, t_close, T_RAMP)
 tgain = t / t[-1]
 fmc_pre = fmc_cos * mute * tgain
 
@@ -200,23 +152,22 @@ srcs = np.vstack((elem_x, elem_z))
 recs = np.vstack((elem_x, elem_z))
 ns, nr = srcs.shape[1], recs.shape[1]
 
-trav_srcs, trav_recs, dist_srcs, dist_recs, _, _ = Kirchhoff._traveltime_table(
-    zm, xm, srcs, recs, V_ALU, mode="analytic"
-)
-eps = 1e-2 * (dist_srcs.max() + dist_recs.max())
-amp_srcs = 1.0 / np.sqrt(dist_srcs + eps)
-amp_recs = 1.0 / np.sqrt(dist_recs + eps)
+trav_srcs, trav_recs, amp_srcs, amp_recs = byot_tables(zm, xm, srcs, recs, V_ALU)
 print(f"byot tables: trav {trav_srcs.shape}, amp {amp_srcs.shape}")
 
+# validate the fork's byot + raw-amp code path before trusting the images
+t0 = time.perf_counter()
+rel_fwd, rel_adj = crosscheck_byot_operator()
+print(f"byot operator cross-check vs VStack: forward rel {rel_fwd:.1e}, "
+      f"adjoint rel {rel_adj:.1e} ({time.perf_counter() - t0:.1f} s)")
+
 wav, _, wavc = ricker(t[:121], f0=FREQ)
-shot_recs = [np.arange(nr) for _ in range(ns)]
 Op = Kirchhoff(
     zm, xm, t, srcs, recs, V_ALU, wav, wavc,
     mode="byot",
     trav=(trav_srcs, trav_recs),
     amp=(amp_srcs, amp_recs),
     dynamic=False,
-    shot_recs=shot_recs,
     engine="numba",
 )
 
