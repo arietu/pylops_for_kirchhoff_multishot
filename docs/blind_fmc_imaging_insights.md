@@ -12,13 +12,23 @@ traveltime/amplitude tables (`mode="byot"`).
 |---|---|---|
 | `tutorials/deepwave_fmc_kirchhoff_blind.py` | contact-style array, homogeneous aluminum plate, one 0.6 mm (0.48 λ) void | 0.30 mm (0.24 λ) error, 151× contrast |
 | `tutorials/deepwave_fmc_kirchhoff_blind_multi.py` | same, five random voids (0.44–0.80 mm, all < λ) | all detected; mean 0.34 mm (0.27 λ), contrast 32–86× |
-| `tutorials/deepwave_fmc_kirchhoff_blind_multi_compare.py` | five-void data, old pipelines vs new | blind pipeline wins every void on both metrics |
+| `tutorials/deepwave_fmc_kirchhoff_blind_multi_compare.py` | five-void data, old pipelines vs new (time-zero corrected for all) | localisation is a tie (0.32–0.38 mm for every pipeline); the blind pipeline wins on **contrast** (min/mean 32×/57× vs 25×/35× for the best old conditioning; ungated pipelines ~1–3×, voids invisible) |
 | `tutorials/deepwave_fmc_kirchhoff_blind_immersion.py` | water / 20 mm aluminum slab / water, five voids, array in water | all detected; mean 0.37 mm (0.30 λ), contrast 25–73× |
 
 All data come from a **single** deepwave finite-difference simulation of the
 true medium per case. The imaging side knows only: the receiver signals, the
 array geometry, the layer velocities/thicknesses, and traveltime + amplitude
 tables.
+
+Everything the studies share — the seeded void recipe, the simulation
+harness, the preprocessing chain, the eikonal solver and the byot table
+construction — lives once in `tutorials/fmc_blind_utils.py`; the shoot-out
+loads (and verifies) the five-void dataset saved by the blind_multi run
+instead of re-deriving it from copied code. Two validation guards run before
+any result is trusted: an eikonal self-test against the analytic homogeneous
+solution, and a cross-check of the fork's byot + raw-amplitude Kirchhoff path
+against an independently assembled VStack of per-shot operators (passes at
+machine precision, ~2×10⁻¹⁶).
 
 ## The blind preprocessing pipeline
 
@@ -30,14 +40,21 @@ Ordered by impact:
    back-wall echo, water multiples, slab reverberations) is *identical* for
    all element pairs, while a localized void diffraction only appears in a few
    pairs. The median trace over pairs therefore estimates exactly the clutter
-   and none of the signal. Worth most of the 2–17× contrast gain over the old
-   conditionings. Offsets with fewer than ~4 pairs have no robust median and
-   are zeroed (negligible aperture loss).
+   and none of the signal. In the corrected shoot-out it lifts the *minimum*
+   per-void contrast from 25× (best old conditioning) to 32× and the mean
+   from 35× to 57×; against ungated data (contrast ~1–3×, voids invisible)
+   it is the difference between detecting and not detecting. Offsets with
+   fewer than ~4 pairs have no robust median and are zeroed (negligible
+   aperture loss).
 2. **Time-zero correction** — the excitation pulse peaks `peak_time` after the
    electrical time zero (0.3 µs for a 1.5/f Ricker delay). Uncorrected, this
-   maps to a systematic ~0.65–0.9 mm depth bias — exactly what all the old
-   pipelines exhibited (0.63–0.68 mm mean error vs 0.34 mm corrected). A
-   one-line fix that halves the localisation error on its own.
+   maps to a systematic ~0.9 mm depth bias — exactly what the old studies
+   exhibited. It is a known instrument property, not a conditioning choice,
+   so the redone shoot-out applies it to *every* pipeline; with it in place,
+   localisation error is essentially pipeline-independent (0.32–0.38 mm
+   mean for all five pipelines) and the pipelines differentiate on contrast
+   only. (The earlier version of the shoot-out corrected only the blind
+   pipeline, which overstated its localisation advantage.)
 3. **Inspection time gates** — top mute after the direct wave / front-wall
    echo, bottom gate just before the back-wall echo. Built only from known
    geometry and velocity. In the layered case the wall reflection time for
@@ -47,23 +64,32 @@ Ordered by impact:
    free.
 5. **Envelope AFTER migration, never before.** Taking the Hilbert envelope of
    the data before migration (an old variant) destroys the phase information
-   the Kirchhoff correlation needs — it was the worst pipeline in the
-   shoot-out (contrast down to 1.5×). The envelope of the migration *image*
-   (along z) is purely cosmetic and always helps readability.
+   the Kirchhoff correlation needs: enveloping the total field leaves the
+   voids as invisible as migrating the raw data (contrast ~1× at the worst
+   void), and enveloping the muted data costs contrast relative to keeping
+   the phase (21×/28× vs 25×/35× min/mean). The envelope of the migration
+   *image* (along z) is purely cosmetic and always helps readability.
 
 ## Operator usage (pylops fork)
 
 - `Kirchhoff(mode="byot", trav=(trav_srcs, trav_recs), amp=(amp_srcs,
-  amp_recs), dynamic=False, shot_recs=[arange(nr)]*ns)` encodes FMC and
-  applies the external amplitudes verbatim.
-- Homogeneous medium: both tables come from the operator itself —
-  `Kirchhoff._traveltime_table(zm, xm, srcs, recs, v, mode="analytic")`
-  returns traveltimes *and* Euclidean distances; spreading weights
-  `1/sqrt(dist + eps)`.
-- Layered medium: traveltimes from the repo's numba fast-sweeping eikonal
-  solver (no scikit-fmm wheel for Python 3.14); the distance/amplitude tables
-  can still come from the operator's analytic mode because Euclidean distance
-  is velocity-independent.
+  amp_recs), dynamic=False)` applies the external amplitudes verbatim. Dense
+  FMC (every element records every shot) is the operator's default geometry;
+  `shot_recs` is only needed for sparse acquisitions (and would also disable
+  `engine="cuda"`).
+- Homogeneous medium: both tables come from the operator itself (traveltimes
+  *and* Euclidean distances; spreading weights `1/sqrt(dist + eps)` with the
+  operator's own `eps = 1e-2 · max dist` regularisation). This recipe — and
+  the underlying call to the private `Kirchhoff._traveltime_table` — lives
+  only in `fmc_blind_utils.byot_tables`, so a future public table-building
+  API in the fork needs a one-file change.
+- Layered medium: traveltimes from the shared numba fast-sweeping eikonal
+  solver (no scikit-fmm wheel for Python 3.14), self-tested against the
+  analytic homogeneous solution before use. For laterally invariant models
+  one padded solve is shifted to all elements (~30× less eikonal work than
+  one solve per element). The distance/amplitude tables still come from the
+  operator's analytic mode because Euclidean distance is
+  velocity-independent.
 
 ## Physics insights
 
@@ -110,7 +136,9 @@ Ordered by impact:
   stock pylops 2.7.0, which lacks `shot_recs` and byot `amp` tuples and will
   otherwise shadow this fork.
 - GPU (torch 2.12 + cu126): a 32-shot 800×600 deepwave FMC simulation takes
-  ~2 s; the three migrations ~2 s; the 32-element eikonal tables ~2 s.
+  ~2 s; the three migrations ~2 s; the 32-element eikonal tables are now
+  effectively free (single padded solve + shifts, <0.1 s); the byot operator
+  cross-check ~2 s.
 
 ## Next steps (from the broader survey)
 

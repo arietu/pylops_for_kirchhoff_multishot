@@ -17,21 +17,28 @@ Imaging-side knowledge is unchanged: the receiver signals, the geometry and
 layer velocities, and traveltime + amplitude tables. The slab makes the
 medium laterally invariant but *vertically* layered, so:
 
-* traveltimes come from the repo's numba fast-sweeping eikonal solver on the
-  void-free layered model (``scikit-fmm`` has no Python 3.14 wheel), passed to
-  :py:class:`pylops.waveeqprocessing.Kirchhoff` via ``mode="byot"``;
-* amplitudes still come **from the Kirchhoff operator itself**:
-  ``Kirchhoff._traveltime_table`` (analytic mode) supplies the source/receiver
-  Euclidean distance tables -- a purely geometric quantity, valid in any
-  medium -- and the 1/sqrt(dist) spreading weights are built from them;
+* traveltimes come from the shared numba fast-sweeping eikonal solver
+  (:func:`fmc_blind_utils.eikonal_trav_table`; ``scikit-fmm`` has no
+  Python 3.14 wheel) on the void-free layered model, validated first against
+  the analytic homogeneous solution
+  (:func:`fmc_blind_utils.eikonal_self_test`) and passed to
+  :py:class:`pylops.waveeqprocessing.Kirchhoff` via ``mode="byot"``. Because
+  the model is laterally invariant, one padded eikonal solve is shifted to
+  all 32 elements instead of solving 32 times;
+* amplitudes still come **from the Kirchhoff operator itself**: its Euclidean
+  distance tables (a purely geometric quantity, valid in any medium) feed the
+  1/sqrt(dist) spreading weights
+  (:func:`fmc_blind_utils.operator_distance_amplitudes`);
 * the front-wall / back-wall **inspection gates are derived from the
   traveltime tables**: the wall reflection time for an element pair (i, j) is
-  ``min over x of [T_i(x, z_wall) + T_j(x, z_wall)]``.
+  ``min over x of [T_i(x, z_wall) + T_j(x, z_wall)]``
+  (:func:`fmc_blind_utils.pair_wall_times`).
 
-The rest of the blind preprocessing is identical to the contact case:
-time-zero correction, zero-phase bandpass, common-offset median subtraction
-(now also cancelling the front-wall echo and every water/slab reverberation,
-all laterally invariant), and a linear time gain.
+The rest of the blind preprocessing is the shared chain from
+:mod:`fmc_blind_utils`: time-zero correction, zero-phase bandpass,
+common-offset median subtraction (now also cancelling the front-wall echo and
+every water/slab reverberation, all laterally invariant), and a linear time
+gain.
 
 Outputs go to ``outputs/deepwave_fmc_blind_immersion/``.
 """
@@ -43,15 +50,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-from numba import njit, prange
-from scipy.signal import butter, hilbert, sosfiltfilt
-
-import deepwave
-from deepwave import scalar
+from scipy.signal import hilbert
 
 from pylops.utils.wavelets import ricker
 from pylops.waveeqprocessing.kirchhoff import Kirchhoff
+
+from fmc_blind_utils import (
+    bandpass,
+    common_offset_median_subtract,
+    cosine_gate_cube,
+    eikonal_self_test,
+    eikonal_trav_table,
+    make_random_voids,
+    carve_voids,
+    operator_distance_amplitudes,
+    pair_wall_times,
+    simulate_fmc,
+    time_zero_correct,
+    T_BW_MARGIN,
+)
 
 OUTDIR = os.path.join("outputs", "deepwave_fmc_blind_immersion")
 os.makedirs(OUTDIR, exist_ok=True)
@@ -72,25 +89,18 @@ Z_TOP, Z_BACK = 0.006, 0.026  # 20 mm slab (thicker than the original 14 mm)
 vel_layers = np.full((nx_s, nz_s), V_WATER, dtype=np.float32)
 vel_layers[:, (zs >= Z_TOP) & (zs < Z_BACK)] = V_ALU
 
-rng = np.random.default_rng(7)
-N_VOIDS = 5
-MIN_SEP = 3.5e-3
-X_RANGE = (0.008, 0.032)
-Z_RANGE = (0.0095, 0.0225)  # inside the slab, clear of both walls
-voids = []
-while len(voids) < N_VOIDS:
-    cx = rng.uniform(*X_RANGE)
-    cz = rng.uniform(*Z_RANGE)
-    if all(np.hypot(cx - vx, cz - vz) >= MIN_SEP for vx, vz, _ in voids):
-        r = 0.5 * rng.uniform(0.3e-3, 0.8e-3)
-        voids.append((cx, cz, r))
-voids.sort(key=lambda v: v[1])
+# five random voids inside the slab, clear of both walls
+voids = make_random_voids(
+    seed=7, n_voids=5, min_sep=3.5e-3,
+    x_range=(0.008, 0.032), z_range=(0.0095, 0.0225),
+    d_range=(0.3e-3, 0.8e-3),
+)
+N_VOIDS = len(voids)
 
 vel_true = vel_layers.copy()
-Xg, Zg = np.meshgrid(xs, zs, indexing="ij")
+carve_voids(vel_true, xs, zs, voids, V_AIR)
 print("true voids (sorted by depth):")
 for k, (cx, cz, r) in enumerate(voids):
-    vel_true[(Xg - cx) ** 2 + (Zg - cz) ** 2 <= r**2] = V_AIR
     print(f"  #{k}: x = {cx * 1e3:6.2f} mm, z = {cz * 1e3:6.2f} mm, "
           f"d = {2 * r * 1e3:.2f} mm = {2 * r / LAM_ALU:.2f} lambda")
 
@@ -103,100 +113,33 @@ elem_iz = np.full(n_el, 40)  # z = 2 mm, in the water
 elem_x = elem_ix * dx
 elem_z = elem_iz * dx
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"deepwave device: {device}")
-
 dt = 5.0e-9
 nt = 2800  # 14 us: back-wall echo at ~11.8 us + margin
 peak_time = 1.5 / FREQ
 
-src_amp = (
-    deepwave.wavelets.ricker(FREQ, nt, dt, peak_time)
-    .reshape(1, 1, -1)
-    .repeat(n_el, 1, 1)
-    .to(device)
-)
-src_loc = torch.tensor(
-    np.stack([elem_iz, elem_ix], axis=-1)[:, None, :], dtype=torch.long, device=device
-)
-rec_loc = torch.tensor(
-    np.broadcast_to(np.stack([elem_iz, elem_ix], axis=-1), (n_el, n_el, 2)).copy(),
-    dtype=torch.long,
-    device=device,
-)
 t0 = time.perf_counter()
-out = scalar(
-    torch.tensor(vel_true.T.copy(), device=device),
-    dx, dt,
-    source_amplitudes=src_amp,
-    source_locations=src_loc,
-    receiver_locations=rec_loc,
-    accuracy=4, pml_width=20, pml_freq=FREQ,
-)
-fmc = out[-1].cpu().numpy().astype(np.float64)
+fmc = simulate_fmc(vel_true, dx, dt, nt, elem_ix, elem_iz, FREQ, peak_time)
 print(f"deepwave FMC sim: {time.perf_counter() - t0:.1f} s, data {fmc.shape}")
 t = np.arange(nt) * dt
 
 # ---------------------------------------------------------------------------
-# 3. Layered-model traveltimes: numba fast-sweeping eikonal (byot tables)
+# 3. Layered-model traveltimes: shared fast-sweeping eikonal (byot tables)
 # ---------------------------------------------------------------------------
-@njit(cache=True)
-def _eikonal_fsm(slow, h, six, siz, n_sweeps=8):
-    """First-arrival traveltimes on a square grid via fast sweeping (Godunov)."""
-    nx, nz = slow.shape
-    BIG = 1.0e30
-    T = np.full((nx, nz), BIG)
-    T[six, siz] = 0.0
-    for _ in range(n_sweeps):
-        for di in range(2):
-            for dj in range(2):
-                i_range = range(nx) if di == 0 else range(nx - 1, -1, -1)
-                for i in i_range:
-                    j_range = range(nz) if dj == 0 else range(nz - 1, -1, -1)
-                    for j in j_range:
-                        if i == six and j == siz:
-                            continue
-                        ux = T[i - 1, j] if i > 0 else BIG
-                        if i < nx - 1 and T[i + 1, j] < ux:
-                            ux = T[i + 1, j]
-                        uz = T[i, j - 1] if j > 0 else BIG
-                        if j < nz - 1 and T[i, j + 1] < uz:
-                            uz = T[i, j + 1]
-                        f = slow[i, j] * h
-                        if abs(ux - uz) >= f:
-                            cand = min(ux, uz) + f
-                        else:
-                            cand = 0.5 * (ux + uz + np.sqrt(2.0 * f * f - (ux - uz) ** 2))
-                        if cand < T[i, j]:
-                            T[i, j] = cand
-    return T
-
-
-@njit(parallel=True, cache=True)
-def _trav_table(slow, h, ix, iz):
-    """Traveltime table (nx*nz, n_pts), raveled in (nx, nz) C-order."""
-    nx, nz = slow.shape
-    npts = ix.shape[0]
-    out = np.empty((nx * nz, npts))
-    for k in prange(npts):
-        T = _eikonal_fsm(slow, h, ix[k], iz[k])
-        out[:, k] = T.ravel()
-    return out
-
-
 dxm = 1.0e-4  # 0.1 mm migration grid
 vel_mig = vel_layers[::2, ::2].astype(np.float64)  # layered, NO voids
 nxm, nzm = vel_mig.shape
 xm = np.arange(nxm) * dxm
 zm = np.arange(nzm) * dxm
 
+rel = eikonal_self_test()  # halt here if the solver is silently broken
+print(f"eikonal self-test vs analytic homogeneous solution: "
+      f"max rel err {rel:.4f}")
+
 six = np.round(elem_x / dxm).astype(np.int64)
 siz = np.round(elem_z / dxm).astype(np.int64)
 t0 = time.perf_counter()
-trav = _trav_table(1.0 / vel_mig, dxm, six, siz)  # (nxm*nzm, n_el)
+trav = eikonal_trav_table(vel_mig, dxm, six, siz)  # (nxm*nzm, n_el)
 print(f"eikonal traveltime tables: {time.perf_counter() - t0:.1f} s")
-trav_srcs = trav
-trav_recs = trav
 
 # ---------------------------------------------------------------------------
 # 4. Amplitude tables FROM THE KIRCHHOFF OPERATOR (geometric distances)
@@ -205,56 +148,30 @@ srcs = np.vstack((elem_x, elem_z))
 recs = np.vstack((elem_x, elem_z))
 ns, nr = srcs.shape[1], recs.shape[1]
 
-_, _, dist_srcs, dist_recs, _, _ = Kirchhoff._traveltime_table(
-    zm, xm, srcs, recs, V_WATER, mode="analytic"
-)
-eps = 1e-2 * (dist_srcs.max() + dist_recs.max())
-amp_srcs = 1.0 / np.sqrt(dist_srcs + eps)
-amp_recs = 1.0 / np.sqrt(dist_recs + eps)
+amp_srcs, amp_recs = operator_distance_amplitudes(zm, xm, srcs, recs)
 
 # ---------------------------------------------------------------------------
 # 5. Blind preprocessing (gates derived from the traveltime tables)
 # ---------------------------------------------------------------------------
-# (a) time-zero correction
-n0 = int(round(peak_time / dt))
-fmc_t0 = np.concatenate([fmc[..., n0:], np.zeros((n_el, n_el, n0))], axis=-1)
+fmc_t0 = time_zero_correct(fmc, peak_time, dt)
+fmc_bp = bandpass(fmc_t0, dt)
 
-# (b) zero-phase bandpass
-sos = butter(4, [2.5e6, 7.5e6], btype="bandpass", fs=1.0 / dt, output="sos")
-fmc_bp = sosfiltfilt(sos, fmc_t0, axis=-1)
-
-# (c) common-offset median subtraction: in this laterally invariant medium it
+# common-offset median subtraction: in this laterally invariant medium it
 # cancels the water direct wave, the front-wall echo, the back-wall echo and
-# every water/slab reverberation; the localised void diffractions survive.
-fmc_cos = fmc_bp.copy()
-MIN_PAIRS = 4
-for k in range(-(n_el - 1), n_el):
-    ii = np.arange(max(0, -k), min(n_el, n_el - k))
-    if len(ii) < MIN_PAIRS:
-        fmc_cos[ii, ii + k, :] = 0.0
-        continue
-    fmc_cos[ii, ii + k, :] -= np.median(fmc_bp[ii, ii + k, :], axis=0)
+# every water/slab reverberation; the localised void diffractions survive
+fmc_cos = common_offset_median_subtract(fmc_bp)
 
-# (d) inspection gates from the eikonal tables: wall reflection time for the
+# inspection gates from the eikonal tables: wall reflection time for the
 # pair (i, j) = min over x of [T_i(x, z_wall) + T_j(x, z_wall)]
 iz_fw = int(round(Z_TOP / dxm))
 iz_bw = int(round(Z_BACK / dxm)) - 1  # just above the back wall
 T3 = trav.reshape(nxm, nzm, n_el)
-t_fw_pair = np.empty((n_el, n_el))
-t_bw_pair = np.empty((n_el, n_el))
-for i in range(n_el):
-    for j in range(n_el):
-        t_fw_pair[i, j] = (T3[:, iz_fw, i] + T3[:, iz_fw, j]).min()
-        t_bw_pair[i, j] = (T3[:, iz_bw, i] + T3[:, iz_bw, j]).min()
+t_fw_pair = pair_wall_times(T3, iz_fw)
+t_bw_pair = pair_wall_times(T3, iz_bw)
 
-T_PAD = 0.7e-6
+T_PAD = 0.7e-6  # the compact water front-wall echo needs less clearance
 T_RAMP = 0.3e-6
-mute = np.ones((n_el, n_el, nt))
-for i in range(n_el):
-    for j in range(n_el):
-        up = np.clip((t - (t_fw_pair[i, j] + T_PAD)) / T_RAMP, 0.0, 1.0)
-        dn = np.clip(((t_bw_pair[i, j] - 0.4e-6) - t) / T_RAMP, 0.0, 1.0)
-        mute[i, j] = (0.5 - 0.5 * np.cos(np.pi * up)) * (0.5 - 0.5 * np.cos(np.pi * dn))
+mute = cosine_gate_cube(t, t_fw_pair + T_PAD, t_bw_pair - T_BW_MARGIN, T_RAMP)
 fmc_pre = fmc_cos * mute * (t / t[-1])
 fmc_mut = fmc_bp * mute * (t / t[-1])  # gates+gain only, for comparison
 
@@ -265,10 +182,9 @@ wav, _, wavc = ricker(t[:121], f0=FREQ)
 Op = Kirchhoff(
     zm, xm, t, srcs, recs, vel_mig, wav, wavc,
     mode="byot",
-    trav=(trav_srcs, trav_recs),
+    trav=(trav, trav),
     amp=(amp_srcs, amp_recs),
     dynamic=False,
-    shot_recs=[np.arange(nr) for _ in range(ns)],
     engine="numba",
 )
 
